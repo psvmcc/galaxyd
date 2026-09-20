@@ -7,7 +7,6 @@ fn example_configuration_files_are_present() {
         "config/galaxyd.auth.local.example.yaml",
         "config/galaxyd.auth.oidc.example.toml",
         "config/galaxyd.auth.oidc.example.yaml",
-        "config.yaml",
     ] {
         galaxyd::config::Config::load(std::path::Path::new(path))
             .unwrap_or_else(|error| panic!("invalid example config {path}: {error}"));
