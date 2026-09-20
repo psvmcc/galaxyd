@@ -1,0 +1,25 @@
+[Unit]
+Description=galaxyd Ansible Galaxy collection server container
+Documentation=https://github.com/psvmcc/galaxyd
+
+[Container]
+Image=ghcr.io/psvmcc/galaxyd:latest
+ContainerName=galaxyd
+AutoUpdate=registry
+Volume=/etc/galaxyd:/etc/galaxyd:ro,Z
+Volume=/var/lib/galaxyd:/var/lib/galaxyd:Z
+PublishPort=8080:8080
+PublishPort=9090:9090
+Environment=RUST_LOG=info
+ReloadSignal=HUP
+ReadOnly=true
+NoNewPrivileges=true
+DropCapability=ALL
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Sign in · galaxyd</title>
+  <style>
+    :root {
+      --bg: #f7f4ed; --surface: #fff; --surface-raised: #f1ede4;
+      --text: #34302f; --muted: #706960; --border: #ddd6c8;
+      --accent: #b85c00; --accent-soft: #d79921; --shadow: 0 2px 8px #34302f1a;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) { --bg: #242424; --surface: #2d2f30; --surface-raised: #383a3b; --text: #e6e1d5; --muted: #aaa49a; --border: #4b4d4f; --accent: #c56a16; --accent-soft: #d18a28; --shadow: 0 2px 8px #0005; }
+    }
+    :root[data-theme="dark"] { --bg: #242424; --surface: #2d2f30; --surface-raised: #383a3b; --text: #e6e1d5; --muted: #aaa49a; --border: #4b4d4f; --accent: #c56a16; --accent-soft: #d18a28; --shadow: 0 2px 8px #0005; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: var(--bg); color: var(--text); font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .card { width: min(420px, calc(100% - 32px)); padding: 28px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); }
+    form { display: grid; gap: 14px; }
+    .error { margin-bottom: 16px; padding: 9px 10px; border: 1px solid #b23c2f66; border-radius: 5px; background: #b23c2f14; color: #b23c2f; }
+    label { display: grid; gap: 6px; color: var(--muted); font-size: 13px; }
+    input { width: 100%; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--text); padding: 10px 11px; font: inherit; }
+    input:focus { outline: 2px solid var(--accent-soft); outline-offset: 1px; }
+    button, .oidc { display: block; width: 100%; border: 1px solid var(--accent); border-radius: 5px; padding: 10px 12px; background: var(--accent); color: #fff; text-align: center; text-decoration: none; font: inherit; cursor: pointer; }
+    .oidc { margin-top: 12px; background: transparent; color: var(--accent); }
+    .divider { display: flex; align-items: center; gap: 10px; margin: 20px 0 0; color: var(--muted); font-size: 12px; }
+    .divider::before, .divider::after { content: ""; height: 1px; flex: 1; background: var(--border); }
+    .bottom-bar { position: fixed; inset: auto 0 0; z-index: 20; height: 34px; background: var(--bg); border-top: 1px solid var(--border); box-shadow: 0 -5px 18px #3c38361a; }
+    .theme { position: absolute; left: 20px; top: 50%; z-index: 21; display: flex; align-items: center; gap: 2px; color: var(--muted); font-size: 12px; opacity: .78; transform: translateY(-50%); }
+    .theme button { display: inline-block; flex: 0 0 30px; width: 30px; height: 30px; padding: 0; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--muted); cursor: pointer; font: 20px/1 inherit; }
+    .theme button.active, .theme button:hover { border-color: var(--border); background: var(--surface-raised); color: var(--text); }
+    .theme button:focus-visible { outline: 2px solid var(--accent-soft); outline-offset: 1px; }
+    .theme button svg { display: block; width: 20px; height: 20px; margin: auto; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
+    .theme button svg .system-fill { fill: currentColor; stroke: none; }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <!-- LOGIN_ERROR -->
+    <form method="post" action="/auth/local/login">
+      <!-- RETURN_TO -->
+      <label>Username <input name="username" value="<!-- USERNAME -->" autocomplete="username" required></label>
+      <label>Password <input type="password" name="password" autocomplete="current-password" required></label>
+      <button type="submit">Sign in</button>
+    </form>
+    <!-- OIDC_OPTION -->
+  </main>
+  <div class="bottom-bar"><div class="theme" aria-label="Theme"><button type="button" data-theme="system" aria-label="Use system theme" title="System"><svg viewBox="0 0 24 24" aria-hidden="true"><path class="system-fill" d="M12 4a8 8 0 0 0 0 16Z"/><circle cx="12" cy="12" r="8"/><path d="M12 4v16"/></svg></button><button type="button" data-theme="light" aria-label="Use light theme" title="Light"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.5"/><path d="M12 2.5v2M12 19.5v2M4.5 4.5l1.4 1.4M18.1 18.1l1.4 1.4M2.5 12h2M19.5 12h2M4.5 19.5l1.4-1.4M18.1 5.9l1.4-1.4"/></svg></button><button type="button" data-theme="dark" aria-label="Use dark theme" title="Dark"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.5 15.5A8 8 0 0 1 8.5 4.5 8.5 8.5 0 1 0 19.5 15.5Z"/></svg></button></div></div>
+  <script>
+    const root = document.documentElement;
+    const buttons = document.querySelectorAll('[data-theme]');
+    const saved = localStorage.getItem('galaxyd-theme') || 'system';
+    if (saved !== 'system') root.dataset.theme = saved;
+    buttons.forEach(button => { button.classList.toggle('active', button.dataset.theme === saved); button.addEventListener('click', () => { const value = button.dataset.theme; localStorage.setItem('galaxyd-theme', value); buttons.forEach(item => item.classList.toggle('active', item === button)); if (value === 'system') delete root.dataset.theme; else root.dataset.theme = value; }); });
+  </script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+[Unit]
+Description=galaxyd Ansible Galaxy collection server
+Documentation=https://github.com/psvmcc/galaxyd
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=galaxyd
+StateDirectoryMode=0750
+ConfigurationDirectory=galaxyd
+ConfigurationDirectoryMode=0750
+EnvironmentFile=-/etc/galaxyd/galaxyd.env
+ExecStart=/usr/local/bin/galaxyd --config /etc/galaxyd/galaxyd.toml
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=45s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

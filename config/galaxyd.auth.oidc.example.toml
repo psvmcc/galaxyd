@@ -1,0 +1,53 @@
+# Example with global authorization through an OIDC provider.
+# The client secret is mounted separately and is never stored in this file.
+
+token_dir = "/etc/galaxyd/tokens"
+
+[server]
+listen = "0.0.0.0:8080"
+observability_listen = "0.0.0.0:9090"
+public_url = "https://galaxy.example.org"
+ui_enabled = true
+
+[auth]
+enabled = true
+session_ttl_seconds = 28800
+
+[auth.oidc]
+enabled = true
+debug = false
+issuer_url = "https://login.example.org/realms/company"
+client_id = "galaxyd"
+client_secret_file = "/etc/galaxyd/oidc-client.secret"
+redirect_url = "https://galaxy.example.org/auth/oidc/callback"
+display_name = "Company SSO"
+groups_claim = "groups"
+
+[[auth.oidc.group_mappings]]
+group = "galaxy-administrators"
+admin = true
+
+[[auth.oidc.group_mappings]]
+group = "galaxy-engineering"
+namespaces = ["engineering"]
+
+[[auth.oidc.group_mappings]]
+group = "galaxy-platform"
+namespaces = ["platform"]
+
+[storage]
+type = "local"
+path = "/var/lib/galaxyd"
+
+[network]
+set_real_ip_from = ["127.0.0.1/32", "10.0.0.0/8"]
+max_upload_bytes = 134217728
+max_forwarded_for_hops = 16
+
+[[namespaces]]
+name = "engineering"
+push_networks = ["10.20.0.0/16"]
+
+[[namespaces]]
+name = "platform"
+push_networks = []

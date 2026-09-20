@@ -1,0 +1,2056 @@
+use crate::{
+    auth, client_ip,
+    config::Config,
+    galaxy,
+    storage::{self, Record, Storage},
+    upload::{read_small_multipart_field, write_multipart_file, UploadReadError},
+};
+use anyhow::{Context, Result};
+use argon2::PasswordVerifier;
+use axum::{
+    extract::{ConnectInfo, DefaultBodyLimit, Form, Multipart, Path, Query, State},
+    http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Json, Redirect, Response},
+    routing::{get, post},
+    Router,
+};
+use base64::Engine;
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use prometheus_client::{encoding::text::encode, metrics::counter::Counter, registry::Registry};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use sha2::Digest;
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
+use tokio::sync::{Mutex, RwLock, Semaphore};
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::{
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<RwLock<Config>>,
+    pub storage: Arc<dyn Storage>,
+    pub ready: Arc<AtomicBool>,
+    pub requests: Counter,
+    pub registry: Arc<RwLock<Registry>>,
+    pub tasks: Arc<Mutex<HashMap<String, ImportTask>>>,
+    pub catalog: Arc<RwLock<Vec<Record>>>,
+    pub sessions: Arc<Mutex<HashMap<String, Session>>>,
+    pub oidc_pending: Arc<Mutex<HashMap<String, OidcPending>>>,
+    pub upload_slots: Arc<Semaphore>,
+    pub auth_slots: Arc<Semaphore>,
+}
+
+#[derive(Clone)]
+pub struct Session {
+    pub username: String,
+    pub auth_source: String,
+    pub admin: bool,
+    pub namespaces: HashSet<String>,
+    pub expires_at: u64,
+}
+
+#[derive(Clone)]
+pub struct OidcPending {
+    pub verifier: String,
+    pub nonce: String,
+    pub return_to: Option<String>,
+    pub expires_at: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ImportTask {
+    pub namespace: String,
+    #[serde(default)]
+    pub collection: Option<String>,
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    pub state: String,
+    pub finished: bool,
+    pub started_at: u64,
+    pub finished_at: Option<u64>,
+}
+
+async fn reconcile_tasks(
+    storage: &Arc<dyn Storage>,
+    catalog: &[Record],
+) -> Result<HashMap<String, ImportTask>> {
+    let mut loaded = Vec::new();
+    for (id, bytes) in storage.tasks().await? {
+        match serde_json::from_slice::<ImportTask>(&bytes) {
+            Ok(mut task) => {
+                let was_running = !task.finished && task.state == "running";
+                if was_running {
+                    let published = task
+                        .collection
+                        .as_deref()
+                        .zip(task.version.as_deref())
+                        .zip(task.sha256.as_deref())
+                        .is_some_and(|((collection, version), sha256)| {
+                            catalog.iter().any(|record| {
+                                record.meta.namespace == task.namespace
+                                    && record.meta.name == collection
+                                    && record.meta.version == version
+                                    && record.sha256 == sha256
+                            })
+                        });
+                    if published || task.started_at.saturating_add(3600) < now() {
+                        task.state = if published { "completed" } else { "failed" }.into();
+                        task.finished = true;
+                        task.finished_at = Some(now());
+                        storage.put_task(&id, &serde_json::to_vec(&task)?).await?;
+                    }
+                }
+                loaded.push((id, task));
+            }
+            Err(error) => tracing::warn!(%id, error=%error, "ignoring invalid import task"),
+        }
+    }
+    loaded.sort_by_key(|(_, task)| std::cmp::Reverse(task.started_at));
+    loaded.truncate(4096);
+    Ok(loaded.into_iter().collect())
+}
+
+pub async fn run(config_path: PathBuf) -> Result<()> {
+    let cfg = Config::load(&config_path)?;
+    let storage = storage::build(&cfg.storage).await?;
+    let catalog = storage.records().await?;
+    if let Err(error) = storage.reconcile(&catalog).await {
+        tracing::warn!(error=%error, "storage reconciliation failed");
+    }
+    let tasks = reconcile_tasks(&storage, &catalog).await?;
+    let ready = Arc::new(AtomicBool::new(storage.ready().await));
+    tracing::info!(config=%config_path.display(), "starting galaxyd");
+    let mut registry = Registry::default();
+    let requests = Counter::default();
+    registry.register("http_requests", "HTTP requests", requests.clone());
+    let state = AppState {
+        config: Arc::new(RwLock::new(cfg)),
+        storage,
+        ready: ready.clone(),
+        requests,
+        registry: Arc::new(RwLock::new(registry)),
+        tasks: Arc::new(Mutex::new(tasks)),
+        catalog: Arc::new(RwLock::new(catalog)),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        oidc_pending: Arc::new(Mutex::new(HashMap::new())),
+        upload_slots: Arc::new(Semaphore::new(2)),
+        auth_slots: Arc::new(Semaphore::new(16)),
+    };
+    let ui_enabled = state.config.read().await.server.ui_enabled;
+    let max_upload_bytes = state.config.read().await.network.max_upload_bytes;
+    let public = public_router(state.clone(), ui_enabled, max_upload_bytes);
+    let observability = observability_router(state.clone());
+    let public_listener =
+        tokio::net::TcpListener::bind(state.config.read().await.server.listen).await?;
+    let obs_listener =
+        tokio::net::TcpListener::bind(state.config.read().await.server.observability_listen)
+            .await?;
+    tracing::info!(public=%public_listener.local_addr()?, observability=%obs_listener.local_addr()?, ready=%ready.load(Ordering::Relaxed), "listeners ready");
+    let reload_state = state.clone();
+    let reload_path = config_path.clone();
+    tokio::spawn(async move {
+        let mut sig =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()).expect("SIGHUP");
+        while sig.recv().await.is_some() {
+            match Config::load(&reload_path) {
+                Ok(new) => {
+                    let old = reload_state.config.read().await.clone();
+                    if new.server.listen != old.server.listen
+                        || new.server.observability_listen != old.server.observability_listen
+                        || new.storage != old.storage
+                        || new.token_dir != old.token_dir
+                        || new.server.public_url != old.server.public_url
+                        || new.network.max_upload_bytes != old.network.max_upload_bytes
+                    {
+                        tracing::error!("configuration reload rejected: listener, public_url, storage, token_dir, or upload-limit changes require restart");
+                    } else {
+                        *reload_state.config.write().await = new;
+                        reload_state.sessions.lock().await.clear();
+                        reload_state.oidc_pending.lock().await.clear();
+                        tracing::info!("configuration reloaded");
+                    }
+                }
+                Err(e) => tracing::error!(error=%e, "configuration reload failed"),
+            }
+        }
+    });
+    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+    let mut public_shutdown = shutdown_tx.subscribe();
+    let mut observability_shutdown = shutdown_tx.subscribe();
+    let signal_tx = shutdown_tx.clone();
+    tokio::spawn(async move {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = terminate.recv() => {},
+        }
+        let _ = signal_tx.send(());
+    });
+    tokio::try_join!(
+        axum::serve(
+            public_listener,
+            public.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = public_shutdown.recv().await;
+        }),
+        axum::serve(obs_listener, observability).with_graceful_shutdown(async move {
+            let _ = observability_shutdown.recv().await;
+        })
+    )?;
+    Ok(())
+}
+
+pub fn public_router(state: AppState, ui_enabled: bool, max_upload_bytes: usize) -> Router {
+    let router = Router::new()
+        .route("/api/galaxy/", get(discovery))
+        .route(
+            "/api/galaxy/v3/artifacts/collections/",
+            post(upload).layer(DefaultBodyLimit::max(
+                max_upload_bytes.saturating_add(1024 * 1024),
+            )),
+        )
+        .route(
+            "/api/galaxy/v3/artifacts/{namespace}/{name}/{version}/",
+            get(download),
+        )
+        .route("/api/galaxy/v3/collections", get(list_collections))
+        .route("/api/galaxy/v3/collections/", get(list_collections))
+        .route("/api/galaxy/v3/namespaces", get(list_namespaces))
+        .route("/api/galaxy/v3/namespaces/", get(list_namespaces))
+        .route(
+            "/api/galaxy/v3/imports/collections/{task_id}/",
+            get(task_status),
+        )
+        .route(
+            "/api/galaxy/v3/collections/{namespace}/{name}/",
+            get(collection),
+        )
+        .route(
+            "/api/galaxy/v3/collections/{namespace}/{name}/versions/",
+            get(collection_versions),
+        )
+        .route(
+            "/api/galaxy/v3/collections/{namespace}/{name}/versions/{version}/",
+            get(collection_version),
+        )
+        .route("/", get(ui));
+    let router = router
+        .route("/auth/status", get(auth_status))
+        .route("/auth/logout", post(logout))
+        .route(
+            "/auth/local/login",
+            get(local_login).post(local_login_submit),
+        )
+        .route("/auth/oidc/login", get(oidc_login))
+        .route("/auth/oidc/callback", get(oidc_callback));
+    let _ = ui_enabled;
+    router
+        .layer(ConcurrencyLimitLayer::new(8))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(60),
+        ))
+        .layer(PropagateRequestIdLayer::x_request_id())
+        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+        .layer(middleware::from_fn_with_state(state.clone(), count_request))
+        .layer(middleware::from_fn(server_header))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+fn observability_router(state: AppState) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
+        .layer(middleware::from_fn(server_header))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+async fn server_header(request: axum::extract::Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        "server",
+        axum::http::HeaderValue::from_static(concat!("galaxyd/", env!("CARGO_PKG_VERSION"))),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    response.headers_mut().insert(
+        "content-security-policy",
+        axum::http::HeaderValue::from_static(
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+        ),
+    );
+    response
+}
+
+async fn count_request(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    state.requests.inc();
+    next.run(request).await
+}
+
+#[derive(Deserialize)]
+struct LoginForm {
+    username: String,
+    password: String,
+    return_to: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ReturnToQuery {
+    return_to: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct UiQuery {
+    namespace: Option<String>,
+    collection: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct OidcQuery {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+async fn auth_status(State(state): State<AppState>, headers: HeaderMap) -> Json<serde_json::Value> {
+    let cfg = state.config.read().await.clone();
+    if !cfg.auth.enabled {
+        return Json(serde_json::json!({"enabled":false,"authenticated":false}));
+    }
+    match session_from_headers(&state, &headers).await {
+        Some((_, session)) => Json(
+            serde_json::json!({"enabled":true,"authenticated":true,"username":session.username,"auth_source":session.auth_source,"admin":session.admin,"namespaces":session.namespaces}),
+        ),
+        None => Json(
+            serde_json::json!({"enabled":true,"authenticated":false,"local":cfg.auth.local.enabled,"oidc":cfg.auth.oidc.enabled}),
+        ),
+    }
+}
+
+async fn local_login(
+    State(state): State<AppState>,
+    Query(query): Query<ReturnToQuery>,
+) -> Response {
+    let cfg = state.config.read().await.clone();
+    if !cfg.auth.local.enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Html(login_page(&cfg, "", None, query.return_to.as_deref())).into_response()
+}
+
+fn login_page(
+    cfg: &Config,
+    username: &str,
+    error: Option<&str>,
+    return_to: Option<&str>,
+) -> String {
+    let return_to = safe_return_to(return_to);
+    let hidden_return_to = return_to
+        .as_deref()
+        .map(|value| {
+            format!(
+                r#"<input type="hidden" name="return_to" value="{}">"#,
+                html_escape(value)
+            )
+        })
+        .unwrap_or_default();
+    let oidc = if cfg.auth.oidc.enabled {
+        let display_name = html_escape(&cfg.auth.oidc.display_name);
+        let oidc_href = return_to
+            .as_deref()
+            .map(|value| {
+                let encoded = url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("return_to", value)
+                    .finish();
+                format!("/auth/oidc/login?{encoded}")
+            })
+            .unwrap_or_else(|| "/auth/oidc/login".into());
+        format!(
+            r#"<div class="divider">or</div><a class="oidc" href="{oidc_href}">Login via {display_name}</a>"#
+        )
+    } else {
+        String::new()
+    };
+    let error = error
+        .map(|message| {
+            format!(
+                r#"<div class="error" role="alert">{}</div>"#,
+                html_escape(message)
+            )
+        })
+        .unwrap_or_default();
+    include_str!("../static/login.html")
+        .replace("<!-- OIDC_OPTION -->", &oidc)
+        .replace("<!-- LOGIN_ERROR -->", &error)
+        .replace("<!-- RETURN_TO -->", &hidden_return_to)
+        .replace("<!-- USERNAME -->", &html_escape(username))
+}
+
+fn safe_return_to(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.starts_with('/')
+        && !value.starts_with("//")
+        && !value.contains('\\')
+        && !value.chars().any(char::is_control)
+    {
+        Some(value.to_owned())
+    } else {
+        None
+    }
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+async fn local_login_submit(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let _auth_slot = match state.auth_slots.clone().try_acquire_owned() {
+        Ok(slot) => slot,
+        Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    };
+    let cfg = state.config.read().await.clone();
+    if !cfg.auth.local.enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let ip = log_ip(peer, &headers, &cfg);
+    let valid = verify_local_password(&cfg.auth.local.users_file, &form.username, &form.password);
+    if !valid {
+        tracing::warn!(ip=%ip, user=%form.username, "web login failed");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Html(login_page(
+                &cfg,
+                &form.username,
+                Some("Invalid credentials. Please try again."),
+                form.return_to.as_deref(),
+            )),
+        )
+            .into_response();
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let session = Session {
+        username: form.username.clone(),
+        auth_source: "local".into(),
+        admin: true,
+        namespaces: cfg
+            .namespaces
+            .iter()
+            .map(|namespace| namespace.name.clone())
+            .collect(),
+        expires_at: now().saturating_add(cfg.auth.session_ttl_seconds),
+    };
+    remember_session(&state, id.clone(), session).await;
+    tracing::info!(ip=%ip, user=%form.username, "web login succeeded");
+    let cookie = session_cookie(
+        &id,
+        cfg.auth.session_ttl_seconds,
+        cfg.server.public_url.starts_with("https://"),
+    );
+    let location = safe_return_to(form.return_to.as_deref()).unwrap_or_else(|| "/".into());
+    (
+        StatusCode::SEE_OTHER,
+        [
+            ("location", location.as_str()),
+            ("set-cookie", cookie.as_str()),
+        ],
+    )
+        .into_response()
+}
+
+async fn logout(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let cfg = state.config.read().await.clone();
+    let ip = log_ip(peer, &headers, &cfg);
+    if let Some(id) = cookie_value(&headers, "galaxyd_session") {
+        if let Some(session) = state.sessions.lock().await.remove(&id) {
+            tracing::info!(ip=%ip, user=%session.username, "web logout");
+        } else {
+            tracing::info!(ip=%ip, user="unknown", "web logout");
+        }
+    } else {
+        tracing::info!(ip=%ip, user="anonymous", "web logout");
+    }
+    (
+        StatusCode::SEE_OTHER,
+        [
+            ("location", "/"),
+            (
+                "set-cookie",
+                "galaxyd_session=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax",
+            ),
+        ],
+    )
+        .into_response()
+}
+
+async fn oidc_login(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<ReturnToQuery>,
+) -> Response {
+    let _auth_slot = match state.auth_slots.clone().try_acquire_owned() {
+        Ok(slot) => slot,
+        Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    };
+    let cfg = state.config.read().await.clone();
+    if !cfg.auth.oidc.enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if cfg.auth.oidc.debug {
+        tracing::debug!(oidc_event="discovery_request", issuer=%cfg.auth.oidc.issuer_url, "OIDC request sent");
+    }
+    tracing::info!(ip=%log_ip(peer, &headers, &cfg), provider=%cfg.auth.oidc.display_name, "OIDC login started");
+    let discovery = match oidc_discovery(&cfg.auth.oidc.issuer_url).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(error=%error, "OIDC discovery failed");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    if cfg.auth.oidc.debug {
+        tracing::debug!(oidc_event="discovery_response", payload=%discovery, "OIDC response received");
+    }
+    let authorization_endpoint = match discovery
+        .get("authorization_endpoint")
+        .and_then(|v| v.as_str())
+    {
+        Some(value) if valid_oidc_endpoint(value) => value,
+        None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Some(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let state_id = uuid::Uuid::new_v4().to_string();
+    // RFC 7636 permits URL-safe unreserved characters. Two UUIDv4 values give
+    // a 72-character verifier with 244 bits of entropy.
+    let verifier = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let mut pending = state.oidc_pending.lock().await;
+    pending.retain(|_, transaction| transaction.expires_at >= now());
+    if pending.len() >= 4096 {
+        if let Some(oldest) = pending
+            .iter()
+            .min_by_key(|(_, transaction)| transaction.expires_at)
+            .map(|(key, _)| key.clone())
+        {
+            pending.remove(&oldest);
+        }
+    }
+    pending.insert(
+        state_id.clone(),
+        OidcPending {
+            verifier: verifier.clone(),
+            nonce: nonce.clone(),
+            return_to: safe_return_to(query.return_to.as_deref()),
+            expires_at: now().saturating_add(300),
+        },
+    );
+    drop(pending);
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(verifier.as_bytes()));
+    let url = url::Url::parse_with_params(
+        authorization_endpoint,
+        &[
+            ("response_type", "code"),
+            ("client_id", cfg.auth.oidc.client_id.as_str()),
+            ("redirect_uri", cfg.auth.oidc.redirect_url.as_str()),
+            ("scope", "openid profile email groups"),
+            ("state", state_id.as_str()),
+            ("code_challenge", challenge.as_str()),
+            ("code_challenge_method", "S256"),
+            ("nonce", nonce.as_str()),
+        ],
+    )
+    .map(|url| url.to_string());
+    if cfg.auth.oidc.debug {
+        tracing::debug!(oidc_event="authorization_request", endpoint=%authorization_endpoint, client_id=%cfg.auth.oidc.client_id, redirect_uri=%cfg.auth.oidc.redirect_url, scope="openid profile email groups", state=%state_id, code_challenge_method="S256", "OIDC request sent");
+    }
+    match url {
+        Ok(url) => {
+            let mut response = Redirect::temporary(&url).into_response();
+            response.headers_mut().append(
+                axum::http::header::SET_COOKIE,
+                axum::http::HeaderValue::from_str(&oidc_state_cookie(
+                    &state_id,
+                    cfg.server.public_url.starts_with("https://"),
+                ))
+                .expect("valid OIDC state cookie"),
+            );
+            response
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+async fn oidc_callback(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(query): Query<OidcQuery>,
+) -> Response {
+    let _auth_slot = match state.auth_slots.clone().try_acquire_owned() {
+        Ok(slot) => slot,
+        Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+    };
+    let cfg = state.config.read().await.clone();
+    let ip = log_ip(peer, &headers, &cfg);
+    if !cfg.auth.oidc.enabled || query.error.is_some() {
+        tracing::warn!(ip=%ip, user="unknown", error=?query.error.as_deref(), "OIDC login failed");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let state_id = match query.state {
+        Some(value) => value,
+        None => {
+            tracing::warn!(ip=%ip, user="unknown", "OIDC login failed: missing state");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    if cookie_value(&headers, "galaxyd_oidc_state").as_deref() != Some(state_id.as_str()) {
+        tracing::warn!(ip=%ip, user="unknown", "OIDC login failed: state cookie mismatch");
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let pending = match state.oidc_pending.lock().await.remove(&state_id) {
+        Some(value) if value.expires_at >= now() => value,
+        _ => {
+            tracing::warn!(ip=%ip, user="unknown", "OIDC login failed: invalid state");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    let code = match query.code {
+        Some(value) => value,
+        None => {
+            tracing::warn!(ip=%ip, user="unknown", "OIDC login failed: missing code");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    if cfg.auth.oidc.debug {
+        tracing::debug!(oidc_event="discovery_request", issuer=%cfg.auth.oidc.issuer_url, "OIDC request sent");
+    }
+    let discovery = match oidc_discovery(&cfg.auth.oidc.issuer_url).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(ip=%ip, user="unknown", error=%error, "OIDC login failed: discovery");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    if cfg.auth.oidc.debug {
+        tracing::debug!(oidc_event="discovery_response", payload=%discovery, "OIDC response received");
+    }
+    let token_endpoint = match discovery.get("token_endpoint").and_then(|v| v.as_str()) {
+        Some(value) if valid_oidc_endpoint(value) => value,
+        _ => {
+            tracing::warn!(ip=%ip, user="unknown", "OIDC login failed: missing token endpoint");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let userinfo_endpoint = match discovery.get("userinfo_endpoint").and_then(|v| v.as_str()) {
+        Some(value) if valid_oidc_endpoint(value) => value,
+        _ => {
+            tracing::warn!(ip=%ip, user="unknown", "OIDC login failed: missing userinfo endpoint");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let secret = match bounded_file(&cfg.auth.oidc.client_secret_file, 16 * 1024) {
+        Ok(value) => value.trim().to_owned(),
+        Err(error) => {
+            tracing::warn!(ip=%ip, user="unknown", error=%error, "OIDC login failed: client secret");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    let token_response = match oidc_client()
+        .post(token_endpoint)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", cfg.auth.oidc.redirect_url.as_str()),
+            ("client_id", cfg.auth.oidc.client_id.as_str()),
+            ("client_secret", secret.as_str()),
+            ("code_verifier", pending.verifier.as_str()),
+        ])
+        .send()
+        .await
+    {
+        Ok(response) => match response.error_for_status() {
+            Ok(response) => {
+                match bounded_response_json::<serde_json::Value>(response, 64 * 1024).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(ip=%ip, user="unknown", error=%error, "OIDC login failed: token response");
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(ip=%ip, user="unknown", error=%error, "OIDC login failed: token status");
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+        },
+        Err(error) => {
+            tracing::warn!(ip=%ip, user="unknown", error=%error, "OIDC login failed: token request");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    if cfg.auth.oidc.debug {
+        tracing::debug!(oidc_event="token_response", payload=%redact_oidc_value(&token_response), "OIDC response received");
+        tracing::debug!(oidc_event="token_request", endpoint=%token_endpoint, client_id=%cfg.auth.oidc.client_id, redirect_uri=%cfg.auth.oidc.redirect_url, grant_type="authorization_code", code_verifier="[redacted]", client_secret="[redacted]", authorization_code="[redacted]", "OIDC request sent");
+    }
+    let access_token = match token_response.get("access_token").and_then(|v| v.as_str()) {
+        Some(value) => value,
+        None => {
+            tracing::warn!(ip=%ip, user="unknown", "OIDC login failed: missing access token");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    };
+    let id_token = match token_response.get("id_token").and_then(|v| v.as_str()) {
+        Some(value) => value,
+        None => {
+            tracing::warn!(ip=%ip, user="unknown", "OIDC login failed: missing ID token");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    };
+    let id_claims = match validate_oidc_id_token(id_token, &discovery, &cfg, &pending.nonce).await {
+        Ok(claims) => claims,
+        Err(error) => {
+            tracing::warn!(ip=%ip, user="unknown", error=%error, "OIDC login failed: invalid ID token");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    };
+    let user = match oidc_client()
+        .get(userinfo_endpoint)
+        .bearer_auth(access_token)
+        .send()
+        .await
+    {
+        Ok(response) => match response.error_for_status() {
+            Ok(response) => {
+                match bounded_response_json::<serde_json::Value>(response, 256 * 1024).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::warn!(ip=%ip, user="unknown", error=%error, "OIDC login failed: userinfo response");
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(ip=%ip, user="unknown", error=%error, "OIDC login failed: userinfo status");
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+        },
+        Err(error) => {
+            tracing::warn!(ip=%ip, user="unknown", error=%error, "OIDC login failed: userinfo request");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    };
+    if id_claims.get("sub").and_then(|value| value.as_str())
+        != user.get("sub").and_then(|value| value.as_str())
+    {
+        tracing::warn!(ip=%ip, user="unknown", "OIDC login failed: ID token and UserInfo subject mismatch");
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if cfg.auth.oidc.debug {
+        tracing::debug!(oidc_event="userinfo_response", payload=%user, "OIDC response received");
+        tracing::debug!(oidc_event="userinfo_request", endpoint=%userinfo_endpoint, access_token="[redacted]", "OIDC request sent");
+    }
+    let groups: HashSet<String> = user
+        .get(&cfg.auth.oidc.groups_claim)
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let username = user
+        .get("preferred_username")
+        .or_else(|| user.get("email"))
+        .or_else(|| user.get("sub"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("OIDC user")
+        .to_owned();
+    let admin = cfg
+        .auth
+        .oidc
+        .group_mappings
+        .iter()
+        .any(|mapping| mapping.admin && groups.contains(&mapping.group));
+    let namespaces: HashSet<String> = cfg
+        .auth
+        .oidc
+        .group_mappings
+        .iter()
+        .filter(|mapping| groups.contains(&mapping.group))
+        .flat_map(|mapping| mapping.namespaces.iter().cloned())
+        .collect();
+    tracing::info!(ip=%ip, user=%username, namespaces=?namespaces, "OIDC login succeeded");
+    let id = uuid::Uuid::new_v4().to_string();
+    remember_session(
+        &state,
+        id.clone(),
+        Session {
+            username,
+            auth_source: "oidc".into(),
+            admin,
+            namespaces,
+            expires_at: now().saturating_add(cfg.auth.session_ttl_seconds),
+        },
+    )
+    .await;
+    let cookie = session_cookie(
+        &id,
+        cfg.auth.session_ttl_seconds,
+        cfg.server.public_url.starts_with("https://"),
+    );
+    let mut response = (
+        StatusCode::SEE_OTHER,
+        [
+            ("location", pending.return_to.as_deref().unwrap_or("/")),
+            ("set-cookie", cookie.as_str()),
+        ],
+    )
+        .into_response();
+    response.headers_mut().append(
+        axum::http::header::SET_COOKIE,
+        axum::http::HeaderValue::from_static(
+            "galaxyd_oidc_state=; Max-Age=0; Path=/auth/oidc; HttpOnly; SameSite=Lax",
+        ),
+    );
+    response
+}
+
+async fn oidc_discovery(issuer: &str) -> anyhow::Result<serde_json::Value> {
+    let response = oidc_client()
+        .get(format!(
+            "{}/.well-known/openid-configuration",
+            issuer.trim_end_matches('/')
+        ))
+        .send()
+        .await?;
+    bounded_response_json(response, 256 * 1024).await
+}
+
+async fn validate_oidc_id_token(
+    token: &str,
+    discovery: &serde_json::Value,
+    cfg: &Config,
+    nonce: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let issuer = discovery
+        .get("issuer")
+        .and_then(|value| value.as_str())
+        .context("OIDC discovery has no issuer")?;
+    if issuer != cfg.auth.oidc.issuer_url {
+        anyhow::bail!("OIDC discovery issuer mismatch")
+    }
+    let jwks_uri = discovery
+        .get("jwks_uri")
+        .and_then(|value| value.as_str())
+        .context("OIDC discovery has no jwks_uri")?;
+    if !valid_oidc_endpoint(jwks_uri) {
+        anyhow::bail!("OIDC discovery has an invalid jwks_uri")
+    }
+    let header = decode_header(token).context("invalid ID token header")?;
+    if !matches!(
+        header.alg,
+        Algorithm::RS256
+            | Algorithm::RS384
+            | Algorithm::RS512
+            | Algorithm::PS256
+            | Algorithm::PS384
+            | Algorithm::PS512
+            | Algorithm::ES256
+            | Algorithm::ES384
+            | Algorithm::EdDSA
+    ) {
+        anyhow::bail!("unsupported ID token algorithm")
+    }
+    let response = oidc_client().get(jwks_uri).send().await?;
+    let keys = bounded_response_json::<jsonwebtoken::jwk::JwkSet>(response, 1024 * 1024).await?;
+    let key = match header.kid.as_deref() {
+        Some(kid) => keys.find(kid).context("ID token key not found")?,
+        None if keys.keys.len() == 1 => &keys.keys[0],
+        None => anyhow::bail!("ID token has no key id"),
+    };
+    let decoding_key = DecodingKey::from_jwk(key).context("unsupported ID token key")?;
+    let mut validation = Validation::new(header.alg);
+    validation.set_issuer(&[cfg.auth.oidc.issuer_url.as_str()]);
+    validation.set_audience(&[cfg.auth.oidc.client_id.as_str()]);
+    validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+    let claims = decode::<serde_json::Value>(token, &decoding_key, &validation)?.claims;
+    if claims.get("nonce").and_then(|value| value.as_str()) != Some(nonce) {
+        anyhow::bail!("ID token nonce mismatch")
+    }
+    Ok(claims)
+}
+
+fn oidc_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("valid OIDC HTTP client configuration")
+}
+
+fn valid_oidc_endpoint(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.fragment().is_none()
+    })
+}
+
+async fn bounded_response_json<T: DeserializeOwned>(
+    response: reqwest::Response,
+    limit: usize,
+) -> anyhow::Result<T> {
+    let mut response = response.error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        anyhow::bail!("HTTP response exceeds size limit")
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            anyhow::bail!("HTTP response exceeds size limit")
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice(&body)?)
+}
+
+fn verify_local_password(path: &std::path::Path, username: &str, password: &str) -> bool {
+    let text = match bounded_file(path, 64 * 1024) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    text.lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| *name == username)
+        .any(|(_, encoded)| {
+            let hash = match argon2::PasswordHash::new(encoded) {
+                Ok(value) => value,
+                Err(_) => return false,
+            };
+            argon2::Argon2::default()
+                .verify_password(password.as_bytes(), &hash)
+                .is_ok()
+        })
+}
+
+fn bounded_file(path: &std::path::Path, limit: usize) -> anyhow::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        anyhow::bail!("file is too large")
+    }
+    Ok(String::from_utf8(bytes)?)
+}
+
+async fn session_from_headers(state: &AppState, headers: &HeaderMap) -> Option<(String, Session)> {
+    let id = cookie_value(headers, "galaxyd_session")?;
+    let session = state.sessions.lock().await.get(&id).cloned()?;
+    if session.expires_at < now() {
+        state.sessions.lock().await.remove(&id);
+        return None;
+    }
+    Some((id, session))
+}
+
+async fn remember_session(state: &AppState, id: String, session: Session) {
+    let mut sessions = state.sessions.lock().await;
+    if sessions.len() >= 4096 {
+        let expired = sessions
+            .iter()
+            .filter(|(_, value)| value.expires_at <= now())
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in expired {
+            sessions.remove(&key);
+        }
+    }
+    if sessions.len() >= 4096 {
+        if let Some(key) = sessions.keys().next().cloned() {
+            sessions.remove(&key);
+        }
+    }
+    sessions.insert(id, session);
+}
+
+async fn remember_task(state: &AppState, id: String, task: ImportTask) {
+    let mut tasks = state.tasks.lock().await;
+    if tasks.len() >= 4096 {
+        if let Some(key) = tasks
+            .iter()
+            .filter(|(_, value)| value.finished)
+            .min_by_key(|(_, value)| value.finished_at.unwrap_or(value.started_at))
+            .map(|(key, _)| key.clone())
+        {
+            tasks.remove(&key);
+        }
+    }
+    if tasks.len() >= 4096 {
+        if let Some(key) = tasks.keys().next().cloned() {
+            tasks.remove(&key);
+        }
+    }
+    tasks.insert(id, task);
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get("cookie")?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find(|(key, _)| *key == name)
+        .map(|(_, value)| value.to_owned())
+}
+fn session_cookie(id: &str, ttl: u64, secure: bool) -> String {
+    format!(
+        "galaxyd_session={id}; Max-Age={ttl}; Path=/; HttpOnly; SameSite=Lax{}",
+        if secure { "; Secure" } else { "" }
+    )
+}
+fn oidc_state_cookie(state: &str, secure: bool) -> String {
+    format!(
+        "galaxyd_oidc_state={state}; Max-Age=300; Path=/auth/oidc; HttpOnly; SameSite=Lax{}",
+        if secure { "; Secure" } else { "" }
+    )
+}
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn rfc3339(timestamp: u64) -> String {
+    i64::try_from(timestamp)
+        .ok()
+        .and_then(|value| time::OffsetDateTime::from_unix_timestamp(value).ok())
+        .and_then(|value| {
+            value
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".into())
+}
+
+async fn discovery(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if state.config.read().await.auth.enabled && auth::bearer(&headers).is_err() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    Json(serde_json::json!({"available_versions":{"v3":"v3/"}})).into_response()
+}
+async fn healthz() -> &'static str {
+    "ok\n"
+}
+async fn readyz(State(state): State<AppState>) -> Response {
+    let ready = state.storage.ready().await;
+    state.ready.store(ready, Ordering::Relaxed);
+    if ready {
+        "ready\n".into_response()
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response()
+    }
+}
+async fn metrics(State(state): State<AppState>) -> Response {
+    let mut out = String::new();
+    encode(&mut out, &*state.registry.read().await).unwrap();
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        out,
+    )
+        .into_response()
+}
+
+async fn list_namespaces(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let cfg = state.config.read().await;
+    let session = if cfg.auth.enabled {
+        session_from_headers(&state, &headers).await
+    } else {
+        None
+    };
+    if cfg.auth.enabled && session.is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let data: Vec<_> = cfg
+        .namespaces
+        .iter()
+        .filter(|namespace| !cfg.auth.enabled || session.as_ref().is_some_and(|(_, session)| session.admin || session.namespaces.contains(&namespace.name)))
+        .map(|namespace| {
+            serde_json::json!({
+                "name": namespace.name,
+                "collections_url": public_link(&cfg.server.public_url, &format!("/api/galaxy/v3/collections?namespace={}", namespace.name)),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({"data": data, "links": {"next": null}})).into_response()
+}
+
+#[derive(Deserialize)]
+struct Search {
+    search: Option<String>,
+    page: Option<usize>,
+    namespace: Option<String>,
+    collection: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+async fn list_collections(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<Search>,
+) -> Response {
+    let cfg = state.config.read().await.clone();
+    let session = if cfg.auth.enabled {
+        session_from_headers(&state, &headers).await
+    } else {
+        None
+    };
+    if cfg.auth.enabled && q.namespace.is_some() {
+        if let Err(status) =
+            require_read_access(&state, &cfg, &headers, q.namespace.as_deref().unwrap()).await
+        {
+            return status.into_response();
+        }
+    } else if cfg.auth.enabled {
+        let Some((_, session_value)) = session else {
+            return StatusCode::UNAUTHORIZED.into_response();
+        };
+        if !session_value.admin {
+            let allowed = session_value.namespaces;
+            let mut records = visible_records(&cfg, state.catalog.read().await.clone());
+            records.retain(|record| allowed.contains(&record.meta.namespace));
+            return list_collection_records(&q, &cfg.server.public_url, records);
+        }
+    }
+    list_collection_records(
+        &q,
+        &cfg.server.public_url,
+        visible_records(&cfg, state.catalog.read().await.clone()),
+    )
+}
+
+fn list_collection_records(q: &Search, public_url: &str, mut records: Vec<Record>) -> Response {
+    if let Some(namespace) = q.namespace.as_deref() {
+        records.retain(|r| r.meta.namespace == namespace);
+    }
+    if let Some(collection) = q.collection.as_deref() {
+        records.retain(|r| r.meta.name == collection);
+    }
+    if let Some(s) = q.search.as_deref() {
+        let needle = s.to_ascii_lowercase();
+        records.retain(|r| {
+            format!("{}.{}", r.meta.namespace, r.meta.name)
+                .to_ascii_lowercase()
+                .contains(&needle)
+        });
+    }
+    records.sort_by(|a, b| {
+        (&a.meta.namespace, &a.meta.name, &a.meta.version).cmp(&(
+            &b.meta.namespace,
+            &b.meta.name,
+            &b.meta.version,
+        ))
+    });
+    let limit = q.limit.unwrap_or(100).clamp(1, 100);
+    let offset = q
+        .offset
+        .unwrap_or_else(|| q.page.unwrap_or(1).saturating_sub(1).saturating_mul(limit));
+    let total = records.len();
+    let next = offset
+        .checked_add(limit)
+        .filter(|next| *next < total)
+        .map(|next| collection_next_link(q, limit, next));
+    Json(serde_json::json!({"data":records.into_iter().skip(offset).take(limit).map(|r| serde_json::json!({"namespace":r.meta.namespace,"name":r.meta.name,"version":r.meta.version,"published_at":rfc3339(r.published_at),"download_url":public_link(public_url, &format!("/api/galaxy/v3/artifacts/{}/{}/{}/",r.meta.namespace,r.meta.name,r.meta.version))})).collect::<Vec<_>>(),"meta":{"count":total},"links":{"next":next},"page":offset / limit + 1})).into_response()
+}
+
+fn collection_next_link(q: &Search, limit: usize, offset: usize) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query
+        .append_pair("limit", &limit.to_string())
+        .append_pair("offset", &offset.to_string());
+    if let Some(value) = q.search.as_deref() {
+        query.append_pair("search", value);
+    }
+    if let Some(value) = q.namespace.as_deref() {
+        query.append_pair("namespace", value);
+    }
+    if let Some(value) = q.collection.as_deref() {
+        query.append_pair("collection", value);
+    }
+    format!("?{}", query.finish())
+}
+async fn collection(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Response {
+    let cfg = state.config.read().await.clone();
+    if let Err(status) = require_read_access(&state, &cfg, &headers, &namespace).await {
+        return status.into_response();
+    }
+    if !namespace_visible(&cfg, &namespace) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let public_url = cfg.server.public_url.clone();
+    let records = state.catalog.read().await.clone();
+    let versions:Vec<_>=records.into_iter().filter(|r|r.meta.namespace==namespace&&r.meta.name==name).map(|r|serde_json::json!({"version":r.meta.version,"published_at":rfc3339(r.published_at),"download_url":public_link(&public_url, &format!("/api/galaxy/v3/artifacts/{}/{}/{}/",namespace,name,r.meta.version))})).collect();
+    if versions.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    Json(serde_json::json!({"namespace":{"name":namespace},"name":name,"created_at":null,"updated_at":null,"versions":versions})).into_response()
+}
+
+async fn collection_versions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Response {
+    let cfg = state.config.read().await.clone();
+    if let Err(status) = require_read_access(&state, &cfg, &headers, &namespace).await {
+        return status.into_response();
+    }
+    if !namespace_visible(&cfg, &namespace) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut records = state.catalog.read().await.clone();
+    records.retain(|r| r.meta.namespace == namespace && r.meta.name == name);
+    records.sort_by(|a, b| {
+        let a = semver::Version::parse(&a.meta.version).ok();
+        let b = semver::Version::parse(&b.meta.version).ok();
+        b.cmp(&a)
+    });
+    let data: Vec<_> = records.into_iter().map(|r| serde_json::json!({"version": r.meta.version, "href": format!("/api/galaxy/v3/collections/{namespace}/{name}/versions/{}/", r.meta.version)})).collect();
+    Json(serde_json::json!({"data":data,"links":{"next":null},"meta":{"count":data.len()}}))
+        .into_response()
+}
+
+async fn collection_version(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((namespace, name, version)): Path<(String, String, String)>,
+) -> Response {
+    let cfg = state.config.read().await.clone();
+    if let Err(status) = require_read_access(&state, &cfg, &headers, &namespace).await {
+        return status.into_response();
+    }
+    if !namespace_visible(&cfg, &namespace) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match state.storage.record(&namespace, &name, &version).await {
+        Ok(r) => Json(serde_json::json!({
+            "namespace":{"name":namespace}, "collection":{"name":name}, "version":version,
+            "href":format!("/api/galaxy/v3/collections/{namespace}/{name}/versions/{version}/"),
+            "download_url":public_link(&cfg.server.public_url, &format!("/api/galaxy/v3/artifacts/{namespace}/{name}/{version}/")),
+            "artifact":{"sha256":r.sha256,"size":r.size}, "metadata":{"dependencies":r.meta.dependencies}, "signatures":[]
+        })).into_response(),
+        Err(error) => storage_status(&error).into_response(),
+    }
+}
+
+fn namespace_visible(cfg: &Config, namespace: &str) -> bool {
+    cfg.namespaces.iter().any(|item| item.name == namespace)
+}
+
+fn visible_records(cfg: &Config, records: Vec<Record>) -> Vec<Record> {
+    records
+        .into_iter()
+        .filter(|r| namespace_visible(cfg, &r.meta.namespace))
+        .collect()
+}
+
+async fn require_read_access(
+    state: &AppState,
+    cfg: &Config,
+    headers: &HeaderMap,
+    namespace: &str,
+) -> Result<(), StatusCode> {
+    if !cfg.auth.enabled {
+        return Ok(());
+    }
+    if let Some((_, session)) = session_from_headers(state, headers).await {
+        if session.admin || session.namespaces.contains(namespace) {
+            return Ok(());
+        }
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let token = auth::bearer(headers).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let namespace_config = cfg
+        .namespaces
+        .iter()
+        .find(|item| item.name == namespace)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    auth::authorize_read(&cfg.token_dir, namespace_config, token)
+        .map_err(|_| StatusCode::UNAUTHORIZED)
+}
+
+fn public_link(base: &str, path: &str) -> String {
+    format!("{}{}", base.trim_end_matches('/'), path)
+}
+
+fn storage_status(error: &anyhow::Error) -> StatusCode {
+    if error.downcast_ref::<storage::StorageError>() == Some(&storage::StorageError::NotFound) {
+        StatusCode::NOT_FOUND
+    } else {
+        tracing::error!(error=%error, "storage operation failed");
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+async fn task_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+) -> Response {
+    let cached = state.tasks.lock().await.get(&task_id).cloned();
+    let task = match cached {
+        Some(task) => Some(task),
+        None => match state.storage.get_task(&task_id).await {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(task) => Some(task),
+                Err(error) => {
+                    tracing::error!(error=%error, %task_id, "invalid stored import task");
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+            },
+            Err(error)
+                if error.downcast_ref::<storage::StorageError>()
+                    == Some(&storage::StorageError::NotFound) =>
+            {
+                None
+            }
+            Err(error) => {
+                tracing::error!(error=%error, %task_id, "import task lookup failed");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        },
+    };
+    match task {
+        Some(task) => {
+            let cfg = state.config.read().await.clone();
+            let namespace_config = match cfg
+                .namespaces
+                .iter()
+                .find(|item| item.name == task.namespace)
+            {
+                Some(namespace) => namespace,
+                None => return StatusCode::NOT_FOUND.into_response(),
+            };
+            if cfg.auth.enabled {
+                let token = match auth::bearer(&headers) {
+                    Ok(token) => token,
+                    Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+                };
+                if auth::authorize_read(&cfg.token_dir, namespace_config, token).is_err() {
+                    return StatusCode::FORBIDDEN.into_response();
+                }
+            }
+            Json(serde_json::json!({
+                "state": task.state,
+                "started_at": rfc3339(task.started_at),
+                "finished_at": task.finished_at.map(rfc3339),
+                "messages": []
+            }))
+            .into_response()
+        }
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+async fn download(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path((namespace, name, version)): Path<(String, String, String)>,
+) -> Response {
+    let cfg = state.config.read().await;
+    let ip = log_ip(peer, &headers, &cfg);
+    if let Err(status) = require_read_access(&state, &cfg, &headers, &namespace).await {
+        if is_browser_navigation(&headers) {
+            tracing::debug!(ip=%ip, namespace=%namespace, collection=%name, version=%version, "collection download unauthorized for browser");
+        } else {
+            tracing::warn!(ip=%ip, namespace=%namespace, collection=%name, version=%version, "collection download unauthorized");
+        }
+        return status.into_response();
+    }
+    if !namespace_visible(&cfg, &namespace) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let actor = if let Some((_, session)) = session_from_headers(&state, &headers).await {
+        session.username
+    } else if let Ok(token) = auth::bearer(&headers) {
+        format!("token:{}", token_hint(token))
+    } else {
+        "anonymous".into()
+    };
+    drop(cfg);
+    match state.storage.stream(&namespace, &name, &version).await {
+        Ok((record, stream)) => {
+            tracing::info!(ip=%ip, user=%actor, namespace=%namespace, collection=%name, version=%version, bytes=record.size, "collection download started");
+            let mut response = axum::body::Body::from_stream(stream).into_response();
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/octet-stream"),
+            );
+            if let Ok(value) = axum::http::HeaderValue::from_str(&record.size.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_LENGTH, value);
+            }
+            let filename = format!(
+                "{}-{}-{}.tar.gz",
+                record.meta.namespace, record.meta.name, record.meta.version
+            );
+            if let Ok(value) =
+                axum::http::HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+            {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::CONTENT_DISPOSITION, value);
+            }
+            response
+        }
+        Err(error) => {
+            tracing::warn!(ip=%ip, user=%actor, namespace=%namespace, collection=%name, version=%version, error=%error, "artifact lookup failed");
+            storage_status(&error).into_response()
+        }
+    }
+}
+
+fn is_browser_navigation(headers: &HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-mode")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("navigate"))
+        || headers
+            .get(axum::http::header::ACCEPT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value.split(',').any(|part| {
+                    part.trim()
+                        .split(';')
+                        .next()
+                        .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/html"))
+                })
+            })
+}
+
+async fn upload(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    let _upload_slot = match state.upload_slots.clone().acquire_owned().await {
+        Ok(slot) => slot,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let cfg = state.config.read().await.clone();
+    let log_ip = log_ip(peer, &headers, &cfg);
+    let token = match auth::bearer(&headers) {
+        Ok(t) => t.to_owned(),
+        Err(error) => {
+            tracing::warn!(ip=%log_ip, error=%error, "collection upload missing token");
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    };
+    let forwarded = match single_forwarded_for(&headers) {
+        Ok(value) => value.map(str::to_owned),
+        Err(error) => {
+            tracing::warn!(ip=%log_ip, token=%token_hint(&token), error=%error, "collection upload rejected: invalid forwarding header");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    let ip = match client_ip::effective_ip(
+        peer.ip(),
+        forwarded.as_deref(),
+        &cfg.network.set_real_ip_from,
+        cfg.network.max_forwarded_for_hops,
+    ) {
+        Ok(i) => i,
+        Err(error) => {
+            tracing::warn!(ip=%log_ip, token=%token_hint(&token), error=%error, "collection upload rejected: invalid client address");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    if !cfg
+        .namespaces
+        .iter()
+        .any(|namespace| auth::authorize(&cfg.token_dir, namespace, &token, ip).is_ok())
+    {
+        tracing::warn!(ip=%ip, token=%token_hint(&token), "collection upload unauthorized before body processing");
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut archive = None;
+    let mut checksum = None;
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(ip=%ip, token=%token_hint(&token), error=%error, "collection upload rejected: invalid multipart body");
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+        };
+        match field.name() {
+            Some("file") if archive.is_none() => {
+                match write_multipart_file(field, cfg.network.max_upload_bytes).await {
+                    Ok(file) => archive = Some(file),
+                    Err(UploadReadError::TooLarge) => {
+                        tracing::warn!(ip=%ip, token=%token_hint(&token), "collection upload rejected: file is missing or too large");
+                        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+                    }
+                    Err(UploadReadError::Invalid(error)) => {
+                        tracing::warn!(ip=%ip, token=%token_hint(&token), error=%error, "collection upload rejected: invalid file field");
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                }
+            }
+            Some("sha256") if checksum.is_none() => {
+                checksum = match read_small_multipart_field(field, 256).await {
+                    Ok(value) => String::from_utf8(value)
+                        .ok()
+                        .map(|value| value.trim().to_owned()),
+                    Err(UploadReadError::TooLarge) => {
+                        return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+                    }
+                    Err(UploadReadError::Invalid(_)) => {
+                        return StatusCode::BAD_REQUEST.into_response();
+                    }
+                }
+            }
+            Some("file" | "sha256") => {
+                tracing::warn!(ip=%ip, token=%token_hint(&token), field=?field.name(), "collection upload rejected: duplicate multipart field");
+                return StatusCode::BAD_REQUEST.into_response();
+            }
+            _ => return StatusCode::BAD_REQUEST.into_response(),
+        }
+    }
+    let archive = match archive {
+        Some(file) => file,
+        None => {
+            tracing::warn!(ip=%ip, token=%token_hint(&token), "collection upload rejected: missing file field");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    let checksum = match checksum {
+        Some(value) if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) => value,
+        _ => {
+            tracing::warn!(ip=%ip, token=%token_hint(&token), "collection upload rejected: missing or invalid sha256 field");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+    let archive_path = archive.path().to_owned();
+    let inspect_checksum = checksum.clone();
+    let inspection = tokio::task::spawn_blocking(move || {
+        galaxy::inspect_path(&archive_path, Some(&inspect_checksum))
+    })
+    .await;
+    let (meta, digest) = match inspection {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            tracing::warn!(ip=%ip, token=%token_hint(&token), error=%error, "collection archive rejected");
+            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        }
+        Err(error) => {
+            tracing::error!(ip=%ip, error=%error, "collection archive inspection task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let namespace_config = match cfg
+        .namespaces
+        .iter()
+        .find(|item| item.name == meta.namespace)
+    {
+        Some(namespace) => namespace,
+        None => {
+            tracing::warn!(ip=%ip, token=%token_hint(&token), namespace=%meta.namespace, "upload rejected for unknown namespace");
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    };
+    if let Err(error) = auth::authorize(&cfg.token_dir, namespace_config, &token, ip) {
+        tracing::warn!(ip=%ip, token=%token_hint(&token), namespace=%namespace_config.name, error=%error, "collection upload unauthorized");
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    let artifact_size = match archive.as_file().metadata() {
+        Ok(metadata) => metadata.len() as usize,
+        Err(error) => {
+            tracing::error!(error=%error, "failed to read temporary artifact metadata");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let record = Record {
+        meta: meta.clone(),
+        sha256: galaxy::hex(&digest),
+        size: artifact_size,
+        artifact: format!("{}.tar.gz", uuid::Uuid::new_v4()),
+        published_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+    let current = state.config.read().await.clone();
+    let current_ip = match client_ip::effective_ip(
+        peer.ip(),
+        forwarded.as_deref(),
+        &current.network.set_real_ip_from,
+        current.network.max_forwarded_for_hops,
+    ) {
+        Ok(ip) => ip,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let current_namespace = match current
+        .namespaces
+        .iter()
+        .find(|namespace| namespace.name == meta.namespace)
+    {
+        Some(namespace) => namespace,
+        None => return StatusCode::FORBIDDEN.into_response(),
+    };
+    if auth::authorize(&current.token_dir, current_namespace, &token, current_ip).is_err() {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let task_id = uuid::Uuid::new_v4().to_string();
+    let started_at = now();
+    let mut task = ImportTask {
+        namespace: meta.namespace.clone(),
+        collection: Some(meta.name.clone()),
+        version: Some(meta.version.clone()),
+        sha256: Some(galaxy::hex(&digest)),
+        state: "running".into(),
+        finished: false,
+        started_at,
+        finished_at: None,
+    };
+    if let Ok(task_bytes) = serde_json::to_vec(&task) {
+        if let Err(error) = state.storage.put_task(&task_id, &task_bytes).await {
+            tracing::error!(error=%error, %task_id, "failed to create import task");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    } else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    match state.storage.publish_file(&record, archive.path()).await {
+        Ok(()) => {
+            state.catalog.write().await.push(record);
+            tracing::info!(ip=%ip, token=%token_hint(&token), namespace=%meta.namespace, collection=%meta.name, version=%meta.version, bytes=artifact_size, "collection published");
+            task.state = "completed".into();
+            task.finished = true;
+            task.finished_at = Some(now());
+            if let Ok(task_bytes) = serde_json::to_vec(&task) {
+                if let Err(error) = state.storage.put_task(&task_id, &task_bytes).await {
+                    tracing::error!(error=%error, %task_id, "failed to complete import task; leaving durable running state");
+                }
+            }
+            remember_task(&state, task_id.clone(), task).await;
+            let public_url = current.server.public_url.clone();
+            (StatusCode::ACCEPTED, Json(serde_json::json!({"state":"completed","task":public_link(&public_url, &format!("/api/galaxy/v3/imports/collections/{task_id}/"))}))).into_response()
+        }
+        Err(error) => {
+            task.state = "failed".into();
+            task.finished = true;
+            task.finished_at = Some(now());
+            if let Ok(task_bytes) = serde_json::to_vec(&task) {
+                let _ = state.storage.put_task(&task_id, &task_bytes).await;
+            }
+            remember_task(&state, task_id, task).await;
+            tracing::warn!(namespace=%meta.namespace, collection=%meta.name, version=%meta.version, error=%error, "collection publication rejected");
+            if matches!(
+                error.downcast_ref::<storage::StorageError>(),
+                Some(storage::StorageError::AlreadyExists)
+            ) {
+                (StatusCode::CONFLICT, Json(serde_json::json!({"state":"failed","error":{"code":"CONFLICT","description":"collection version already exists"}}))).into_response()
+            } else {
+                (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"state":"failed","error":{"code":"STORAGE_UNAVAILABLE","description":"storage operation failed"}}))).into_response()
+            }
+        }
+    }
+}
+
+async fn ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<UiQuery>,
+) -> Response {
+    let cfg = state.config.read().await.clone();
+    if !cfg.server.ui_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if cfg.auth.enabled && session_from_headers(&state, &headers).await.is_none() {
+        let mut return_url = url::Url::parse("http://localhost/").expect("static URL");
+        if let Some(value) = query.namespace.as_deref() {
+            return_url.query_pairs_mut().append_pair("namespace", value);
+        }
+        if let Some(value) = query.collection.as_deref() {
+            return_url
+                .query_pairs_mut()
+                .append_pair("collection", value);
+        }
+        let return_to = format!(
+            "{}{}",
+            return_url.path(),
+            return_url
+                .query()
+                .map(|value| format!("?{value}"))
+                .unwrap_or_default()
+        );
+        if cfg.auth.local.enabled {
+            let target = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair(
+                    "return_to",
+                    &safe_return_to(Some(return_to.as_str())).unwrap_or_else(|| "/".into()),
+                )
+                .finish();
+            return Redirect::temporary(&format!("/auth/local/login?{target}")).into_response();
+        }
+        if cfg.auth.oidc.enabled {
+            let target = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair(
+                    "return_to",
+                    &safe_return_to(Some(return_to.as_str())).unwrap_or_else(|| "/".into()),
+                )
+                .finish();
+            return Redirect::temporary(&format!("/auth/oidc/login?{target}")).into_response();
+        }
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if cfg.server.ui_enabled {
+        Html(include_str!("../static/index.html")).into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
+fn single_forwarded_for(headers: &HeaderMap) -> Result<Option<&str>> {
+    let mut values = headers.get_all("x-forwarded-for").iter();
+    let first = values.next();
+    if values.next().is_some() {
+        anyhow::bail!("duplicate X-Forwarded-For")
+    }
+    first
+        .map(|value| value.to_str().map_err(Into::into))
+        .transpose()
+}
+
+fn log_ip(peer: SocketAddr, headers: &HeaderMap, cfg: &Config) -> String {
+    let peer_ip = peer.ip();
+    let forwarded = single_forwarded_for(headers).ok().flatten();
+    client_ip::effective_ip(
+        peer_ip,
+        forwarded,
+        &cfg.network.set_real_ip_from,
+        cfg.network.max_forwarded_for_hops,
+    )
+    .map(|ip| ip.to_string())
+    .unwrap_or_else(|_| peer_ip.to_string())
+}
+
+fn token_hint(token: &str) -> String {
+    let digest = sha2::Sha256::digest(token.as_bytes());
+    format!("sha256:{}", galaxy::hex(&digest[..8]))
+}
+
+fn redact_oidc_value(value: &serde_json::Value) -> serde_json::Value {
+    let mut redacted = value.clone();
+    if let Some(object) = redacted.as_object_mut() {
+        for key in [
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "client_secret",
+            "code",
+            "code_verifier",
+        ] {
+            if object.contains_key(key) {
+                object.insert(key.into(), serde_json::Value::String("[redacted]".into()));
+            }
+        }
+    }
+    redacted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    async fn state() -> AppState {
+        let cfg = Config::default();
+        let storage = storage::LocalStorage::new(tempfile::tempdir().unwrap().keep());
+        AppState {
+            config: Arc::new(RwLock::new(cfg)),
+            storage: Arc::new(storage),
+            ready: Arc::new(AtomicBool::new(true)),
+            requests: Counter::default(),
+            registry: Arc::new(RwLock::new(Registry::default())),
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+            catalog: Arc::new(RwLock::new(Vec::new())),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            oidc_pending: Arc::new(Mutex::new(HashMap::new())),
+            upload_slots: Arc::new(Semaphore::new(2)),
+            auth_slots: Arc::new(Semaphore::new(16)),
+        }
+    }
+
+    #[tokio::test]
+    async fn namespaces_are_read_from_configuration() {
+        let state = state().await;
+        state
+            .config
+            .write()
+            .await
+            .namespaces
+            .push(crate::config::NamespaceConfig {
+                name: "engineering".into(),
+                push_networks: vec![],
+            });
+        let response = public_router(state, true, 128 * 1024 * 1024)
+            .oneshot(
+                Request::get("/api/galaxy/v3/namespaces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"][0]["name"], "engineering");
+    }
+
+    #[tokio::test]
+    async fn ui_is_embedded() {
+        let response = public_router(state().await, true, 128 * 1024 * 1024)
+            .oneshot(Request::get("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("<title>galaxyd</title>"));
+    }
+
+    #[test]
+    fn formats_rfc3339_without_fractional_seconds() {
+        assert_eq!(rfc3339(1_600_000_000), "2020-09-13T12:26:40Z");
+        assert!(!rfc3339(1_600_000_000).contains('.'));
+    }
+
+    #[test]
+    fn validates_oidc_endpoints() {
+        assert!(valid_oidc_endpoint("https://id.example.test/jwks"));
+        assert!(!valid_oidc_endpoint("file:///etc/passwd"));
+        assert!(!valid_oidc_endpoint(
+            "https://user:pass@id.example.test/jwks"
+        ));
+        assert!(!valid_oidc_endpoint(
+            "https://id.example.test/jwks#fragment"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconciles_running_task_with_published_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn Storage> =
+            Arc::new(storage::LocalStorage::new(directory.path().to_path_buf()));
+        let bytes = b"artifact";
+        let record = Record {
+            meta: galaxy::CollectionMeta {
+                namespace: "engineering".into(),
+                name: "common".into(),
+                version: "1.0.0".into(),
+                dependencies: serde_json::json!({}),
+            },
+            sha256: galaxy::hex(&sha2::Sha256::digest(bytes)),
+            size: bytes.len(),
+            artifact: "artifact.tar.gz".into(),
+            published_at: now(),
+        };
+        storage.publish(&record, bytes).await.unwrap();
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let task = ImportTask {
+            namespace: "engineering".into(),
+            collection: Some("common".into()),
+            version: Some("1.0.0".into()),
+            sha256: Some(record.sha256.clone()),
+            state: "running".into(),
+            finished: false,
+            started_at: now(),
+            finished_at: None,
+        };
+        storage
+            .put_task(&task_id, &serde_json::to_vec(&task).unwrap())
+            .await
+            .unwrap();
+
+        let reconciled = reconcile_tasks(&storage, std::slice::from_ref(&record))
+            .await
+            .unwrap();
+        assert_eq!(reconciled[&task_id].state, "completed");
+        assert!(reconciled[&task_id].finished);
+    }
+
+    #[tokio::test]
+    async fn pagination_preserves_filters_and_formats_dates() {
+        let records = ["common", "common_extra"]
+            .into_iter()
+            .map(|name| Record {
+                meta: galaxy::CollectionMeta {
+                    namespace: "engineering".into(),
+                    name: name.into(),
+                    version: "1.0.0".into(),
+                    dependencies: serde_json::json!({}),
+                },
+                sha256: "00".repeat(32),
+                size: 1,
+                artifact: format!("{name}.tar.gz"),
+                published_at: 1_600_000_000,
+            })
+            .collect();
+        let response = list_collection_records(
+            &Search {
+                search: Some("common".into()),
+                page: None,
+                namespace: Some("engineering".into()),
+                collection: None,
+                limit: Some(1),
+                offset: None,
+            },
+            "https://galaxy.example.test",
+            records,
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"][0]["published_at"], "2020-09-13T12:26:40Z");
+        let next = json["links"]["next"].as_str().unwrap();
+        assert!(next.contains("limit=1"));
+        assert!(next.contains("offset=1"));
+        assert!(next.contains("search=common"));
+        assert!(next.contains("namespace=engineering"));
+    }
+
+    #[tokio::test]
+    async fn global_auth_blocks_anonymous_catalog_and_allows_admin_session() {
+        let state = state().await;
+        {
+            let mut cfg = state.config.write().await;
+            cfg.auth.enabled = true;
+            cfg.auth.local.enabled = true;
+            cfg.namespaces.push(crate::config::NamespaceConfig {
+                name: "engineering".into(),
+                push_networks: vec![],
+            });
+        }
+        let response = public_router(state.clone(), true, 128 * 1024 * 1024)
+            .oneshot(
+                Request::get("/api/galaxy/v3/namespaces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let id = "test-session";
+        state.sessions.lock().await.insert(
+            id.into(),
+            Session {
+                username: "test".into(),
+                auth_source: "local".into(),
+                admin: true,
+                namespaces: HashSet::new(),
+                expires_at: now() + 60,
+            },
+        );
+        let response = public_router(state, true, 128 * 1024 * 1024)
+            .oneshot(
+                Request::get("/api/galaxy/v3/namespaces")
+                    .header("cookie", "galaxyd_session=test-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn local_login_uses_catalog_theme() {
+        let state = state().await;
+        {
+            let mut config = state.config.write().await;
+            config.auth.local.enabled = true;
+            config.auth.oidc.enabled = true;
+            config.auth.oidc.display_name = "Corporate SSO".into();
+        }
+        let response = public_router(state, true, 128 * 1024 * 1024)
+            .oneshot(
+                Request::get("/auth/local/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("--surface-raised"));
+        assert!(html.contains("galaxyd-theme"));
+        assert!(html.contains("autocomplete=\"current-password\""));
+        assert!(!html.contains("<h1>galaxyd</h1>"));
+        assert!(!html.contains("Powered by galaxyd"));
+        assert!(html.contains(".theme { position: absolute;"));
+        assert!(html.contains("display: flex; align-items: center;"));
+        assert!(html.contains("Login via Corporate SSO"));
+    }
+}
