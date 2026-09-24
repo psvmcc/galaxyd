@@ -65,6 +65,10 @@ pub struct OidcConfig {
     pub enabled: bool,
     #[serde(default)]
     pub debug: bool,
+    #[serde(default = "default_true")]
+    pub request_offline_access: bool,
+    #[serde(default = "default_oidc_refresh_interval")]
+    pub refresh_interval_seconds: u64,
     #[serde(default)]
     pub issuer_url: String,
     #[serde(default)]
@@ -114,6 +118,8 @@ impl Default for OidcConfig {
         Self {
             enabled: false,
             debug: false,
+            request_offline_access: true,
+            refresh_interval_seconds: default_oidc_refresh_interval(),
             issuer_url: String::new(),
             client_id: String::new(),
             client_secret_file: PathBuf::new(),
@@ -140,7 +146,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: "0.0.0.0:8080".parse().unwrap(),
-            observability_listen: "0.0.0.0:9090".parse().unwrap(),
+            observability_listen: default_metrics_listener(),
             public_url: default_public_url(),
             ui_enabled: true,
         }
@@ -205,7 +211,7 @@ fn default_public_listener() -> SocketAddr {
     "0.0.0.0:8080".parse().unwrap()
 }
 fn default_metrics_listener() -> SocketAddr {
-    "0.0.0.0:9090".parse().unwrap()
+    "127.0.0.1:9090".parse().unwrap()
 }
 fn default_public_url() -> String {
     "http://localhost:8080".into()
@@ -221,6 +227,9 @@ fn default_max_upload_bytes() -> usize {
 }
 fn default_session_ttl() -> u64 {
     8 * 60 * 60
+}
+fn default_oidc_refresh_interval() -> u64 {
+    300
 }
 fn default_admin_users_file() -> PathBuf {
     PathBuf::from("/etc/galaxyd/admins.users")
@@ -256,6 +265,12 @@ impl Config {
         Ok(cfg)
     }
     pub fn validate(&self) -> Result<()> {
+        if self.auth.oidc.refresh_interval_seconds == 0
+            || (self.auth.oidc.enabled
+                && self.auth.oidc.refresh_interval_seconds >= self.auth.session_ttl_seconds)
+        {
+            anyhow::bail!("OIDC refresh interval must be positive and shorter than session TTL")
+        }
         if self.network.max_upload_bytes == 0 || self.network.max_forwarded_for_hops == 0 {
             anyhow::bail!("network limits must be positive")
         }
@@ -330,7 +345,14 @@ impl Config {
                 ("OIDC redirect_url", &self.auth.oidc.redirect_url),
             ] {
                 let parsed = url::Url::parse(value).with_context(|| format!("invalid {name}"))?;
-                if !matches!(parsed.scheme(), "http" | "https")
+                if !(parsed.scheme() == "https"
+                    || (parsed.scheme() == "http"
+                        && parsed.host_str().is_some_and(|host| {
+                            host.eq_ignore_ascii_case("localhost")
+                                || host
+                                    .parse::<std::net::IpAddr>()
+                                    .is_ok_and(|ip| ip.is_loopback())
+                        })))
                     || parsed.host().is_none()
                     || !parsed.username().is_empty()
                     || parsed.password().is_some()
@@ -425,5 +447,15 @@ mod tests {
         let path = dir.path().join("config.yaml");
         std::fs::write(&path, vec![b' '; 1024 * 1024 + 1]).unwrap();
         assert!(Config::load(&path).is_err());
+    }
+
+    #[test]
+    fn oidc_refresh_interval_must_precede_session_expiry() {
+        let mut cfg = Config::load(Path::new("config/galaxyd.auth.oidc.example.toml")).unwrap();
+        assert!(cfg.validate().is_ok());
+        cfg.auth.oidc.refresh_interval_seconds = cfg.auth.session_ttl_seconds;
+        assert!(cfg.validate().is_err());
+        cfg.auth.oidc.refresh_interval_seconds = 0;
+        assert!(cfg.validate().is_err());
     }
 }

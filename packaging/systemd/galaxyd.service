@@ -6,13 +6,13 @@ After=network-online.target
 
 [Service]
 Type=simple
-DynamicUser=yes
+User=galaxyd
+Group=galaxyd
 StateDirectory=galaxyd
 StateDirectoryMode=0750
-ConfigurationDirectory=galaxyd
-ConfigurationDirectoryMode=0750
 EnvironmentFile=-/etc/galaxyd/galaxyd.env
 ExecStart=/usr/local/bin/galaxyd --config /etc/galaxyd/galaxyd.toml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=45s

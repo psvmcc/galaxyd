@@ -28,6 +28,8 @@ users_file = "/etc/galaxyd/admins.users"
 [auth.oidc]
 enabled = false
 debug = false
+request_offline_access = true
+refresh_interval_seconds = 300
 issuer_url = "https://login.example.org/realms/company"
 client_id = "galaxyd"
 client_secret_file = "/etc/galaxyd/oidc-client.secret"
@@ -45,7 +47,7 @@ namespaces = ["engineering"]
 
 [server]
 listen = "0.0.0.0:8080"
-observability_listen = "0.0.0.0:9090"
+observability_listen = "127.0.0.1:9090"
 public_url = "https://galaxy.example.org"
 ui_enabled = true
 
@@ -62,7 +64,7 @@ path = "/var/lib/galaxyd"
 # force_path_style = false
 
 [network]
-set_real_ip_from = ["127.0.0.1/32", "10.0.0.0/8"]
+set_real_ip_from = [] # Configure only the exact addresses of trusted reverse proxies.
 max_upload_bytes = 134217728
 max_forwarded_for_hops = 16
 
@@ -80,7 +82,7 @@ push_networks = []
 ~~~yaml
 server:
   listen: 0.0.0.0:8080
-  observability_listen: 0.0.0.0:9090
+  observability_listen: 127.0.0.1:9090
   public_url: https://galaxy.example.org
   ui_enabled: true
 
@@ -89,9 +91,7 @@ storage:
   path: /var/lib/galaxyd
 
 network:
-  set_real_ip_from:
-    - 127.0.0.1/32
-    - 10.0.0.0/8
+  set_real_ip_from: [] # Configure only exact trusted reverse-proxy addresses.
   max_upload_bytes: 134217728
   max_forwarded_for_hops: 16
 
@@ -108,7 +108,7 @@ namespaces:
 ## server
 
 - listen: socket address, default 0.0.0.0:8080. Public API and UI listener.
-- observability_listen: socket address, default 0.0.0.0:9090. Health and metrics listener. Must differ from listen.
+- observability_listen: socket address, default 127.0.0.1:9090. Health and metrics listener. Must differ from listen.
 - public_url: string, default http://localhost:8080. External URL for public links; no trailing slash.
 - ui_enabled: boolean, default true. When false, / is disabled.
 
@@ -148,7 +148,7 @@ Path to namespace token files. Default:
 /etc/galaxyd/tokens
 ~~~
 
-For namespace engineering, the file is <token_dir>/engineering.secrets. Each non-empty, non-comment line is a token. Use mode 0600 where possible.
+For namespace engineering, the file is <token_dir>/engineering.secrets. Each non-empty, non-comment line is a token. Keep it readable only by the service (mode 0600 when owned by it, or 0640 with a dedicated service group).
 
 The file is read on each authorization decision, so token rotation does not need a restart:
 
@@ -168,7 +168,11 @@ When global authorization is enabled, machine read access requires a namespace t
 
 An RO token in `.read.secrets` permits metadata, version listing, and artifact download. A write token in `.write.secrets` permits all of those operations and publishing. The legacy `<namespace>.secrets` filename remains a write-token file. A write token is intentionally accepted for read operations. Without a valid RO or write token, Ansible clients receive `401`; local administrators and authorized OIDC users use their browser session instead.
 
-With `auth.enabled = false`, these files do not affect anonymous read access. With `auth.enabled = true`, anonymous users cannot access the catalog or UI. The `/api/galaxy/` discovery response remains available so clients can discover v3, but namespace data requires a session or namespace token.
+With `auth.enabled = false`, these files do not affect anonymous read access. With `auth.enabled = true`, anonymous users cannot access the catalog or UI. The `/api/galaxy/` discovery response requires a valid session or a read/write token for at least one configured namespace.
+
+Local login and logout require the browser's `Origin` to match `server.public_url` in scheme, hostname, and port. If a browser form returns `403`, check that `public_url` is the address users actually open, including HTTPS and any non-default port. Rejected origins and unavailable local-user files are recorded in server logs without logging passwords.
+
+OIDC `request_offline_access` defaults to `true`. Set it to `false` only when the provider rejects that scope. `refresh_interval_seconds` defaults to 300 and must be shorter than `session_ttl_seconds`. The server checks current groups on the first request after that interval. Without a refresh token, the session ends at that check and the user signs in again. A temporary provider error returns `503` while preserving the session for a later retry; revoked refresh credentials end the session.
 
 Generate a local administrator password hash without putting the password in shell history:
 
@@ -176,9 +180,9 @@ Generate a local administrator password hash without putting the password in she
 printf '%s\n' 'change-me' | galaxyd password-hash
 ~~~
 
-Create `/etc/galaxyd/admins.users` with one `username:argon2id PHC hash` entry per line. Local users are global administrators. OIDC users receive namespace access from `group_mappings`; a mapping with `admin = true` grants all namespaces. The OIDC client secret is read from its separate file. Set both files to mode 0600 and their containing directory to mode 0700.
+Create `/etc/galaxyd/admins.users` with one `username:argon2id PHC hash` entry per line. Local users are global administrators. OIDC users receive namespace access from `group_mappings`; a mapping with `admin = true` grants all namespaces. The OIDC client secret is read from its separate file. Keep both files readable only by the service (mode 0600 when owned by it, or 0640 with a dedicated service group). Restrict their containing directory to the service and administrator accounts.
 
-OIDC discovery, JWKS, token, and UserInfo responses have strict size limits and timeouts. Provider endpoints must be absolute HTTP(S) URLs without embedded credentials or fragments.
+OIDC discovery, JWKS, token, and UserInfo responses have strict size limits and timeouts. Provider endpoints must use HTTPS; HTTP is accepted only for loopback development endpoints. URLs cannot contain embedded credentials or fragments.
 
 ## namespaces
 

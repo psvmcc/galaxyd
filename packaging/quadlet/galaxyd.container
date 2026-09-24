@@ -9,10 +9,11 @@ AutoUpdate=registry
 Volume=/etc/galaxyd:/etc/galaxyd:ro,Z
 Volume=/var/lib/galaxyd:/var/lib/galaxyd:Z
 PublishPort=8080:8080
-PublishPort=9090:9090
+PublishPort=127.0.0.1:9090:9090
 Environment=RUST_LOG=info
 ReloadSignal=HUP
 ReadOnly=true
+Tmpfs=/tmp:rw,noexec,nosuid,nodev,size=512m
 NoNewPrivileges=true
 DropCapability=ALL
 

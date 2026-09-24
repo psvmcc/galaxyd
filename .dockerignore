@@ -1,0 +1,8 @@
+**
+!Containerfile
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!static/
+!static/**

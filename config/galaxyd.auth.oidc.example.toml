@@ -5,7 +5,7 @@ token_dir = "/etc/galaxyd/tokens"
 
 [server]
 listen = "0.0.0.0:8080"
-observability_listen = "0.0.0.0:9090"
+observability_listen = "127.0.0.1:9090"
 public_url = "https://galaxy.example.org"
 ui_enabled = true
 
@@ -16,6 +16,8 @@ session_ttl_seconds = 28800
 [auth.oidc]
 enabled = true
 debug = false
+request_offline_access = true
+refresh_interval_seconds = 300
 issuer_url = "https://login.example.org/realms/company"
 client_id = "galaxyd"
 client_secret_file = "/etc/galaxyd/oidc-client.secret"
@@ -40,7 +42,7 @@ type = "local"
 path = "/var/lib/galaxyd"
 
 [network]
-set_real_ip_from = ["127.0.0.1/32", "10.0.0.0/8"]
+set_real_ip_from = [] # Add only the exact reverse-proxy addresses used in deployment.
 max_upload_bytes = 134217728
 max_forwarded_for_hops = 16
 

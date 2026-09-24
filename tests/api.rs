@@ -83,6 +83,9 @@ async fn exposes_ansible_collection_version_contract() {
         oidc_pending: Arc::new(Mutex::new(HashMap::new())),
         upload_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         auth_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+        failed_logins: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        auth_gate: Arc::new(RwLock::new(0)),
+        refresh_slots: Arc::new(tokio::sync::Semaphore::new(8)),
     };
     let app = public_router(state, true, 16 * 1024 * 1024);
     let response = app
@@ -172,6 +175,9 @@ async fn accepts_multipart_larger_than_axum_default_limit() {
         oidc_pending: Arc::new(Mutex::new(HashMap::new())),
         upload_slots: Arc::new(tokio::sync::Semaphore::new(2)),
         auth_slots: Arc::new(tokio::sync::Semaphore::new(16)),
+        failed_logins: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        auth_gate: Arc::new(RwLock::new(0)),
+        refresh_slots: Arc::new(tokio::sync::Semaphore::new(8)),
     };
 
     let mut payload = vec![0u8; 3 * 1024 * 1024];

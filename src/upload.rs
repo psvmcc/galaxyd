@@ -26,32 +26,67 @@ pub(crate) async fn write_multipart_file(
     let mut output = tokio::fs::File::from_std(reopened);
     if encoded {
         let encoded_limit = decoded_limit.saturating_mul(2).saturating_add(4096);
-        let mut bytes = Vec::new();
+        let mut pending = Vec::new();
+        let mut encoded_size = 0usize;
+        let mut decoded_size = 0usize;
+        let mut saw_padding = false;
         while let Some(chunk) = field
             .chunk()
             .await
             .map_err(|error| UploadReadError::Invalid(error.to_string()))?
         {
-            if bytes.len().saturating_add(chunk.len()) > encoded_limit {
+            for byte in chunk
+                .iter()
+                .copied()
+                .filter(|byte| !byte.is_ascii_whitespace())
+            {
+                if saw_padding {
+                    return Err(UploadReadError::Invalid(
+                        "base64 data follows padding".into(),
+                    ));
+                }
+                encoded_size = encoded_size.saturating_add(1);
+                if encoded_size > encoded_limit {
+                    return Err(UploadReadError::TooLarge);
+                }
+                pending.push(byte);
+            }
+            let full_groups = pending.len() / 4 * 4;
+            let process_size = if let Some(padding) = pending.iter().position(|byte| *byte == b'=')
+            {
+                saw_padding = true;
+                padding / 4 * 4
+            } else {
+                full_groups
+            };
+            if process_size > 0 {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(&pending[..process_size])
+                    .map_err(|error| UploadReadError::Invalid(error.to_string()))?;
+                decoded_size = decoded_size.saturating_add(decoded.len());
+                if decoded_size > decoded_limit {
+                    return Err(UploadReadError::TooLarge);
+                }
+                output
+                    .write_all(&decoded)
+                    .await
+                    .map_err(|error| UploadReadError::Invalid(error.to_string()))?;
+                pending.drain(..process_size);
+            }
+        }
+        if !pending.is_empty() {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&pending)
+                .map_err(|error| UploadReadError::Invalid(error.to_string()))?;
+            decoded_size = decoded_size.saturating_add(decoded.len());
+            if decoded_size > decoded_limit {
                 return Err(UploadReadError::TooLarge);
             }
-            bytes.extend(
-                chunk
-                    .iter()
-                    .copied()
-                    .filter(|byte| !byte.is_ascii_whitespace()),
-            );
+            output
+                .write_all(&decoded)
+                .await
+                .map_err(|error| UploadReadError::Invalid(error.to_string()))?;
         }
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(bytes)
-            .map_err(|error| UploadReadError::Invalid(error.to_string()))?;
-        if decoded.len() > decoded_limit {
-            return Err(UploadReadError::TooLarge);
-        }
-        output
-            .write_all(&decoded)
-            .await
-            .map_err(|error| UploadReadError::Invalid(error.to_string()))?;
     } else {
         let mut written = 0usize;
         while let Some(chunk) = field
