@@ -26,6 +26,21 @@ pub enum StorageError {
     NotFound,
 }
 
+const MAX_RECORD_BYTES: usize = 64 * 1024;
+const MAX_LEGACY_RECORD_BYTES: usize = 2 * 1024 * 1024;
+
+fn encoded_record(record: &Record) -> Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(record)?;
+    if bytes.len() > MAX_RECORD_BYTES {
+        anyhow::bail!("publication record exceeds size limit")
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn validate_record(record: &Record) -> Result<()> {
+    encoded_record(record).map(|_| ())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
     pub meta: CollectionMeta,
@@ -149,6 +164,7 @@ impl S3Storage {
 #[async_trait]
 impl Storage for S3Storage {
     async fn publish(&self, record: &Record, bytes: &[u8]) -> Result<()> {
+        let record_bytes = encoded_record(record)?;
         let artifact_key = self.artifact_key(record);
         self.client
             .put_object()
@@ -169,7 +185,7 @@ impl Storage for S3Storage {
                 &record.meta.version,
             ))
             .if_none_match("*")
-            .body(ByteStream::from(serde_json::to_vec(record)?))
+            .body(ByteStream::from(record_bytes))
             .content_type("application/json")
             .send()
             .await;
@@ -198,6 +214,7 @@ impl Storage for S3Storage {
         Ok(())
     }
     async fn publish_file(&self, record: &Record, path: &Path) -> Result<()> {
+        let record_bytes = encoded_record(record)?;
         let artifact_key = self.artifact_key(record);
         self.client
             .put_object()
@@ -218,7 +235,7 @@ impl Storage for S3Storage {
                 &record.meta.version,
             ))
             .if_none_match("*")
-            .body(ByteStream::from(serde_json::to_vec(record)?))
+            .body(ByteStream::from(record_bytes))
             .content_type("application/json")
             .send()
             .await;
@@ -281,7 +298,11 @@ impl Storage for S3Storage {
             }
             Err(error) => return Err(error).context("reading publication record"),
         };
-        let record: Record = serde_json::from_slice(&object.body.collect().await?.into_bytes())?;
+        let body = object.body.collect().await?.into_bytes();
+        if body.len() > MAX_LEGACY_RECORD_BYTES {
+            anyhow::bail!("publication record exceeds legacy size limit")
+        }
+        let record: Record = serde_json::from_slice(&body)?;
         if record.meta.namespace != namespace
             || record.meta.name != name
             || record.meta.version != version
@@ -348,8 +369,8 @@ impl Storage for S3Storage {
             Err(error) => return Err(error).context("reading publication record"),
         };
         let body = object.body.collect().await?.into_bytes();
-        if body.len() > 64 * 1024 {
-            anyhow::bail!("publication record exceeds size limit")
+        if body.len() > MAX_LEGACY_RECORD_BYTES {
+            anyhow::bail!("publication record exceeds legacy size limit")
         }
         let record: Record = serde_json::from_slice(&body)?;
         if record.meta.namespace != namespace
@@ -410,9 +431,14 @@ impl Storage for S3Storage {
             let page = request.send().await?;
             if let Some(objects) = page.contents {
                 for object in objects {
-                    if object.size.is_some_and(|size| size > 64 * 1024) {
-                        tracing::warn!(key=?object.key, "ignoring oversized publication record");
-                        continue;
+                    if object
+                        .size
+                        .is_some_and(|size| size > MAX_LEGACY_RECORD_BYTES as i64)
+                    {
+                        anyhow::bail!(
+                            "publication record exceeds legacy size limit: {:?}",
+                            object.key
+                        )
                     }
                     if let Some(key) = object.key {
                         let body = self
@@ -426,6 +452,9 @@ impl Storage for S3Storage {
                             .collect()
                             .await?
                             .into_bytes();
+                        if body.len() > MAX_LEGACY_RECORD_BYTES {
+                            anyhow::bail!("publication record exceeds legacy size limit")
+                        }
                         result.push(serde_json::from_slice(&body)?);
                     }
                 }
@@ -757,8 +786,8 @@ impl LocalStorage {
                     anyhow::Error::from(error)
                 }
             })?;
-        if data.len() > 64 * 1024 {
-            anyhow::bail!("publication record exceeds size limit")
+        if data.len() > MAX_LEGACY_RECORD_BYTES {
+            anyhow::bail!("publication record exceeds legacy size limit")
         }
         let record: Record = serde_json::from_slice(&data)?;
         if record.meta.namespace != namespace
@@ -770,6 +799,7 @@ impl LocalStorage {
         Ok(record)
     }
     fn publish_sync(&self, record: &Record, bytes: &[u8]) -> Result<()> {
+        let record_bytes = encoded_record(record)?;
         validate_key(
             &record.meta.namespace,
             &record.meta.name,
@@ -789,7 +819,6 @@ impl LocalStorage {
             .open(&final_artifact)?;
         artifact.write_all(bytes)?;
         artifact.sync_all()?;
-        let record_bytes = serde_json::to_vec(record)?;
         let record_tmp = tempfile::NamedTempFile::new_in(&record_dir)?;
         let rp = self.record_path(
             &record.meta.namespace,
@@ -821,6 +850,7 @@ impl LocalStorage {
         Ok(())
     }
     fn publish_file_sync(&self, record: &Record, source: &Path) -> Result<()> {
+        let record_bytes = encoded_record(record)?;
         validate_key(
             &record.meta.namespace,
             &record.meta.name,
@@ -845,7 +875,6 @@ impl LocalStorage {
             anyhow::bail!("artifact size changed during publication")
         }
         artifact.sync_all()?;
-        let record_bytes = serde_json::to_vec(record)?;
         let record_tmp = tempfile::NamedTempFile::new_in(&record_dir)?;
         {
             let mut file = OpenOptions::new()
@@ -926,9 +955,11 @@ fn read_records(root: &Path) -> Result<Vec<Record>> {
             if path.is_dir() {
                 pending.push(path);
             } else if path.extension().and_then(|x| x.to_str()) == Some("json") {
-                if std::fs::metadata(&path)?.len() > 64 * 1024 {
-                    tracing::warn!(record=%path.display(), "ignoring oversized publication record");
-                    continue;
+                if std::fs::metadata(&path)?.len() > MAX_LEGACY_RECORD_BYTES as u64 {
+                    anyhow::bail!(
+                        "publication record exceeds legacy size limit: {}",
+                        path.display()
+                    )
                 }
                 out.push(serde_json::from_slice(&std::fs::read(path)?)?);
             }
@@ -1048,5 +1079,40 @@ mod tests {
         storage.publish(&first, b"test").await.unwrap();
         storage.publish(&second, b"test").await.unwrap();
         assert_eq!(storage.records().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn oversized_record_is_rejected_before_publication_but_legacy_data_is_retained() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = LocalStorage::new(directory.path().to_path_buf());
+        let mut record = record();
+        record.meta.dependencies = serde_json::json!({"engineering.extra": "x".repeat(70_000)});
+        assert!(storage.publish(&record, b"test").await.is_err());
+        assert!(!directory
+            .path()
+            .join("artifacts")
+            .join(&record.artifact)
+            .exists());
+
+        let path = storage.record_path("engineering", "common", "1.0.0");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(directory.path().join("artifacts")).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let artifact = directory.path().join("artifacts").join(&record.artifact);
+        std::fs::write(&artifact, b"test").unwrap();
+        std::fs::File::open(&artifact)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(48 * 3600),
+            ))
+            .unwrap();
+        let records = storage.records().await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(storage
+            .record("engineering", "common", "1.0.0")
+            .await
+            .is_ok());
+        storage.reconcile(&records).await.unwrap();
+        assert!(artifact.exists());
     }
 }

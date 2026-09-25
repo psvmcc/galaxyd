@@ -7,6 +7,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub const OIDC_CALLBACK_PATH: &str = "/auth/oidc/callback";
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -75,8 +77,6 @@ pub struct OidcConfig {
     pub client_id: String,
     #[serde(default)]
     pub client_secret_file: PathBuf,
-    #[serde(default)]
-    pub redirect_url: String,
     #[serde(default = "default_oidc_display_name")]
     pub display_name: String,
     #[serde(default = "default_groups_claim")]
@@ -123,7 +123,6 @@ impl Default for OidcConfig {
             issuer_url: String::new(),
             client_id: String::new(),
             client_secret_file: PathBuf::new(),
-            redirect_url: String::new(),
             display_name: default_oidc_display_name(),
             groups_claim: default_groups_claim(),
             group_mappings: Vec::new(),
@@ -242,6 +241,10 @@ fn default_oidc_display_name() -> String {
 }
 
 impl Config {
+    pub fn oidc_redirect_url(&self) -> String {
+        format!("{}{OIDC_CALLBACK_PATH}", self.server.public_url)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         const MAX_CONFIG_BYTES: usize = 1024 * 1024;
         use std::io::Read;
@@ -332,34 +335,37 @@ impl Config {
         if self.auth.oidc.enabled
             && (self.auth.oidc.issuer_url.is_empty()
                 || self.auth.oidc.client_id.is_empty()
-                || self.auth.oidc.client_secret_file.as_os_str().is_empty()
-                || self.auth.oidc.redirect_url.is_empty())
+                || self.auth.oidc.client_secret_file.as_os_str().is_empty())
         {
-            anyhow::bail!(
-                "enabled OIDC requires issuer_url, client_id, client_secret_file, and redirect_url"
-            )
+            anyhow::bail!("enabled OIDC requires issuer_url, client_id, and client_secret_file")
         }
         if self.auth.oidc.enabled {
-            for (name, value) in [
-                ("OIDC issuer_url", &self.auth.oidc.issuer_url),
-                ("OIDC redirect_url", &self.auth.oidc.redirect_url),
-            ] {
-                let parsed = url::Url::parse(value).with_context(|| format!("invalid {name}"))?;
-                if !(parsed.scheme() == "https"
-                    || (parsed.scheme() == "http"
-                        && parsed.host_str().is_some_and(|host| {
-                            host.eq_ignore_ascii_case("localhost")
-                                || host
-                                    .parse::<std::net::IpAddr>()
-                                    .is_ok_and(|ip| ip.is_loopback())
-                        })))
-                    || parsed.host().is_none()
-                    || !parsed.username().is_empty()
-                    || parsed.password().is_some()
-                    || parsed.fragment().is_some()
-                {
-                    anyhow::bail!("{name} must be an absolute http(s) URL")
-                }
+            let issuer_url =
+                url::Url::parse(&self.auth.oidc.issuer_url).context("invalid OIDC issuer_url")?;
+            if !(issuer_url.scheme() == "https"
+                || (issuer_url.scheme() == "http"
+                    && issuer_url.host_str().is_some_and(|host| {
+                        host.eq_ignore_ascii_case("localhost")
+                            || host
+                                .parse::<std::net::IpAddr>()
+                                .is_ok_and(|ip| ip.is_loopback())
+                    })))
+                || issuer_url.host().is_none()
+                || !issuer_url.username().is_empty()
+                || issuer_url.password().is_some()
+                || issuer_url.fragment().is_some()
+            {
+                anyhow::bail!("OIDC issuer_url must be an absolute http(s) URL")
+            }
+            if public_url.scheme() == "http"
+                && !public_url.host_str().is_some_and(|host| {
+                    host.eq_ignore_ascii_case("localhost")
+                        || host
+                            .parse::<std::net::IpAddr>()
+                            .is_ok_and(|ip| ip.is_loopback())
+                })
+            {
+                anyhow::bail!("OIDC requires an HTTPS public_url (HTTP is allowed on loopback)")
             }
             if self.auth.oidc.groups_claim.trim().is_empty() {
                 anyhow::bail!("OIDC groups_claim must not be empty")
@@ -457,5 +463,25 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.auth.oidc.refresh_interval_seconds = 0;
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn oidc_redirect_url_uses_public_url() {
+        let mut cfg = Config::load(Path::new("config/galaxyd.auth.oidc.example.toml")).unwrap();
+        assert_eq!(
+            cfg.oidc_redirect_url(),
+            "https://galaxy.example.org/auth/oidc/callback"
+        );
+        cfg.server.public_url = "http://localhost:18080".into();
+        assert!(cfg.validate().is_ok());
+        assert_eq!(
+            cfg.oidc_redirect_url(),
+            "http://localhost:18080/auth/oidc/callback"
+        );
+        cfg.server.public_url = "http://galaxy.example.org".into();
+        assert!(cfg.validate().is_err());
+        let old_key =
+            "[auth.oidc]\nredirect_url = 'https://galaxy.example.org/auth/oidc/callback'\n";
+        assert!(toml::from_str::<Config>(old_key).is_err());
     }
 }

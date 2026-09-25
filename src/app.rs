@@ -1,6 +1,6 @@
 use crate::{
     auth, client_ip,
-    config::Config,
+    config::{Config, OIDC_CALLBACK_PATH},
     galaxy,
     storage::{self, Record, Storage},
     upload::{read_small_multipart_field, write_multipart_file, UploadReadError},
@@ -34,6 +34,7 @@ use std::{
     },
 };
 use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio_util::task::TaskTracker;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::{
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
@@ -57,6 +58,7 @@ pub struct AppState {
     pub failed_logins: Arc<Mutex<HashMap<IpAddr, VecDeque<std::time::Instant>>>>,
     pub auth_gate: Arc<RwLock<u64>>,
     pub refresh_slots: Arc<Semaphore>,
+    pub publications: TaskTracker,
 }
 
 #[derive(Clone)]
@@ -127,12 +129,10 @@ async fn reconcile_tasks(
                                     && record.sha256 == sha256
                             })
                         });
-                    if published || task.started_at.saturating_add(3600) < now() {
-                        task.state = if published { "completed" } else { "failed" }.into();
-                        task.finished = true;
-                        task.finished_at = Some(now());
-                        storage.put_task(&id, &serde_json::to_vec(&task)?).await?;
-                    }
+                    task.state = if published { "completed" } else { "failed" }.into();
+                    task.finished = true;
+                    task.finished_at = Some(now());
+                    storage.put_task(&id, &serde_json::to_vec(&task)?).await?;
                 }
                 loaded.push((id, task));
             }
@@ -172,6 +172,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         failed_logins: Arc::new(Mutex::new(HashMap::new())),
         auth_gate: Arc::new(RwLock::new(0)),
         refresh_slots: Arc::new(Semaphore::new(8)),
+        publications: TaskTracker::new(),
     };
     let readiness = state.ready.clone();
     let readiness_storage = state.storage.clone();
@@ -225,7 +226,7 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         }
         let _ = signal_tx.send(());
     });
-    tokio::try_join!(
+    let result = tokio::try_join!(
         axum::serve(
             public_listener,
             public.into_make_service_with_connect_info::<SocketAddr>(),
@@ -236,7 +237,10 @@ pub async fn run(config_path: PathBuf) -> Result<()> {
         axum::serve(obs_listener, observability).with_graceful_shutdown(async move {
             let _ = observability_shutdown.recv().await;
         })
-    )?;
+    );
+    state.publications.close();
+    state.publications.wait().await;
+    result?;
     Ok(())
 }
 
@@ -267,7 +271,9 @@ pub fn public_router(state: AppState, ui_enabled: bool, max_upload_bytes: usize)
         .route(
             "/api/galaxy/v3/artifacts/collections/",
             post(upload).layer(DefaultBodyLimit::max(
-                max_upload_bytes.saturating_add(1024 * 1024),
+                max_upload_bytes
+                    .saturating_mul(2)
+                    .saturating_add(1024 * 1024),
             )),
         )
         .route(
@@ -305,7 +311,7 @@ pub fn public_router(state: AppState, ui_enabled: bool, max_upload_bytes: usize)
                 .layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/auth/oidc/login", get(oidc_login))
-        .route("/auth/oidc/callback", get(oidc_callback));
+        .route(OIDC_CALLBACK_PATH, get(oidc_callback));
     let _ = ui_enabled;
     router
         .layer(ConcurrencyLimitLayer::new(8))
@@ -756,12 +762,13 @@ async fn oidc_login(
     } else {
         "openid profile email groups"
     };
+    let redirect_url = cfg.oidc_redirect_url();
     let url = url::Url::parse_with_params(
         authorization_endpoint,
         &[
             ("response_type", "code"),
             ("client_id", cfg.auth.oidc.client_id.as_str()),
-            ("redirect_uri", cfg.auth.oidc.redirect_url.as_str()),
+            ("redirect_uri", redirect_url.as_str()),
             ("scope", scope),
             ("state", state_id.as_str()),
             ("code_challenge", challenge.as_str()),
@@ -771,7 +778,7 @@ async fn oidc_login(
     )
     .map(|url| url.to_string());
     if cfg.auth.oidc.debug {
-        tracing::debug!(oidc_event="authorization_request", endpoint=%authorization_endpoint, client_id=%cfg.auth.oidc.client_id, redirect_uri=%cfg.auth.oidc.redirect_url, scope=%scope, state=%state_id, code_challenge_method="S256", "OIDC request sent");
+        tracing::debug!(oidc_event="authorization_request", endpoint=%authorization_endpoint, client_id=%cfg.auth.oidc.client_id, redirect_uri=%redirect_url, scope=%scope, state=%state_id, code_challenge_method="S256", "OIDC request sent");
     }
     match url {
         Ok(url) => {
@@ -866,12 +873,13 @@ async fn oidc_callback(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
+    let redirect_url = cfg.oidc_redirect_url();
     let token_response = match oidc_client()
         .post(token_endpoint)
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
-            ("redirect_uri", cfg.auth.oidc.redirect_url.as_str()),
+            ("redirect_uri", redirect_url.as_str()),
             ("client_id", cfg.auth.oidc.client_id.as_str()),
             ("client_secret", secret.as_str()),
             ("code_verifier", pending.verifier.as_str()),
@@ -901,7 +909,7 @@ async fn oidc_callback(
     };
     if cfg.auth.oidc.debug {
         tracing::debug!(oidc_event="token_response", payload=%redact_oidc_value(&token_response), "OIDC response received");
-        tracing::debug!(oidc_event="token_request", endpoint=%token_endpoint, client_id=%cfg.auth.oidc.client_id, redirect_uri=%cfg.auth.oidc.redirect_url, grant_type="authorization_code", code_verifier="[redacted]", client_secret="[redacted]", authorization_code="[redacted]", "OIDC request sent");
+        tracing::debug!(oidc_event="token_request", endpoint=%token_endpoint, client_id=%cfg.auth.oidc.client_id, redirect_uri=%redirect_url, grant_type="authorization_code", code_verifier="[redacted]", client_secret="[redacted]", authorization_code="[redacted]", "OIDC request sent");
     }
     let access_token = match token_response.get("access_token").and_then(|v| v.as_str()) {
         Some(value) => value,
@@ -1947,7 +1955,7 @@ async fn upload(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
-    let _upload_slot = match state.upload_slots.clone().acquire_owned().await {
+    let upload_slot = match state.upload_slots.clone().acquire_owned().await {
         Ok(slot) => slot,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -1995,7 +2003,7 @@ async fn upload(
             Ok(None) => break,
             Err(error) => {
                 tracing::warn!(ip=%ip, token=%token_hint(&token), error=%error, "collection upload rejected: invalid multipart body");
-                return StatusCode::BAD_REQUEST.into_response();
+                return error.status().into_response();
             }
         };
         match field.name() {
@@ -2010,6 +2018,9 @@ async fn upload(
                         tracing::warn!(ip=%ip, token=%token_hint(&token), error=%error, "collection upload rejected: invalid file field");
                         return StatusCode::BAD_REQUEST.into_response();
                     }
+                    Err(UploadReadError::Multipart(error)) => {
+                        return error.status().into_response();
+                    }
                 }
             }
             Some("sha256") if checksum.is_none() => {
@@ -2022,6 +2033,9 @@ async fn upload(
                     }
                     Err(UploadReadError::Invalid(_)) => {
                         return StatusCode::BAD_REQUEST.into_response();
+                    }
+                    Err(UploadReadError::Multipart(error)) => {
+                        return error.status().into_response();
                     }
                 }
             }
@@ -2095,6 +2109,10 @@ async fn upload(
             .unwrap_or_default()
             .as_secs(),
     };
+    if let Err(error) = storage::validate_record(&record) {
+        tracing::warn!(ip=%ip, namespace=%meta.namespace, collection=%meta.name, version=%meta.version, error=%error, "collection metadata rejected");
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
     let current = state.config.read().await.clone();
     let current_ip = match client_ip::effective_ip(
         peer.ip(),
@@ -2118,7 +2136,7 @@ async fn upload(
     }
     let task_id = uuid::Uuid::new_v4().to_string();
     let started_at = now();
-    let mut task = ImportTask {
+    let task = ImportTask {
         namespace: meta.namespace.clone(),
         collection: Some(meta.name.clone()),
         version: Some(meta.version.clone()),
@@ -2128,47 +2146,64 @@ async fn upload(
         started_at,
         finished_at: None,
     };
-    if let Ok(task_bytes) = serde_json::to_vec(&task) {
-        if let Err(error) = state.storage.put_task(&task_id, &task_bytes).await {
-            tracing::error!(error=%error, %task_id, "failed to create import task");
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    let task_bytes = match serde_json::to_vec(&task) {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    let worker_state = state.clone();
+    let worker_id = task_id.clone();
+    let worker_ip = ip;
+    let worker_token_hint = token_hint(&token);
+    state.publications.spawn(async move {
+        let _upload_slot = upload_slot;
+        let mut task = task;
+        if let Err(error) = worker_state.storage.put_task(&worker_id, &task_bytes).await {
+            tracing::error!(error=%error, task_id=%worker_id, "failed to create import task");
+            let _ = result_tx.send(Err(error));
+            return;
         }
-    } else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-    match state.storage.publish_file(&record, archive.path()).await {
-        Ok(()) => {
-            state.catalog.write().await.push(record);
-            tracing::info!(ip=%ip, token=%token_hint(&token), namespace=%meta.namespace, collection=%meta.name, version=%meta.version, bytes=artifact_size, "collection published");
-            task.state = "completed".into();
-            task.finished = true;
-            task.finished_at = Some(now());
-            if let Ok(task_bytes) = serde_json::to_vec(&task) {
-                if let Err(error) = state.storage.put_task(&task_id, &task_bytes).await {
-                    tracing::error!(error=%error, %task_id, "failed to complete import task; leaving durable running state");
+        let result = worker_state
+            .storage
+            .publish_file(&record, archive.path())
+            .await;
+        task.state = if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        }
+        .into();
+        task.finished = true;
+        task.finished_at = Some(now());
+        if result.is_ok() {
+            worker_state.catalog.write().await.push(record);
+            tracing::info!(ip=%worker_ip, token=%worker_token_hint, namespace=%meta.namespace, collection=%meta.name, version=%meta.version, bytes=artifact_size, "collection published");
+        } else if let Err(ref error) = result {
+            tracing::warn!(namespace=%meta.namespace, collection=%meta.name, version=%meta.version, error=%error, "collection publication rejected");
+        }
+        match serde_json::to_vec(&task) {
+            Ok(bytes) => {
+                if let Err(error) = worker_state.storage.put_task(&worker_id, &bytes).await {
+                    tracing::error!(error=%error, task_id=%worker_id, "failed to finish import task");
                 }
             }
-            remember_task(&state, task_id.clone(), task).await;
+            Err(error) => {
+                tracing::error!(error=%error, task_id=%worker_id, "failed to encode import task")
+            }
+        }
+        remember_task(&worker_state, worker_id, task).await;
+        let _ = result_tx.send(result);
+    });
+    match result_rx.await {
+        Ok(Ok(())) => {
             let public_url = current.server.public_url.clone();
             (StatusCode::ACCEPTED, Json(serde_json::json!({"state":"completed","task":public_link(&public_url, &format!("/api/galaxy/v3/imports/collections/{task_id}/"))}))).into_response()
         }
-        Err(error) => {
-            task.state = "failed".into();
-            task.finished = true;
-            task.finished_at = Some(now());
-            if let Ok(task_bytes) = serde_json::to_vec(&task) {
-                let _ = state.storage.put_task(&task_id, &task_bytes).await;
-            }
-            remember_task(&state, task_id, task).await;
-            tracing::warn!(namespace=%meta.namespace, collection=%meta.name, version=%meta.version, error=%error, "collection publication rejected");
-            if matches!(
-                error.downcast_ref::<storage::StorageError>(),
-                Some(storage::StorageError::AlreadyExists)
-            ) {
-                (StatusCode::CONFLICT, Json(serde_json::json!({"state":"failed","error":{"code":"CONFLICT","description":"collection version already exists"}}))).into_response()
-            } else {
-                (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"state":"failed","error":{"code":"STORAGE_UNAVAILABLE","description":"storage operation failed"}}))).into_response()
-            }
+        Ok(Err(error)) if matches!(error.downcast_ref::<storage::StorageError>(), Some(storage::StorageError::AlreadyExists)) => {
+            (StatusCode::CONFLICT, Json(serde_json::json!({"state":"failed","error":{"code":"CONFLICT","description":"collection version already exists"}}))).into_response()
+        }
+        Ok(Err(_)) | Err(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"state":"failed","error":{"code":"STORAGE_UNAVAILABLE","description":"storage operation failed"}}))).into_response()
         }
     }
 }
@@ -2293,6 +2328,72 @@ mod tests {
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
+    struct PausedPublishStorage {
+        inner: storage::LocalStorage,
+        published: Arc<tokio::sync::Notify>,
+        resume: Arc<tokio::sync::Notify>,
+        pause_on_create: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Storage for PausedPublishStorage {
+        async fn publish(&self, record: &Record, bytes: &[u8]) -> Result<()> {
+            self.inner.publish(record, bytes).await
+        }
+        async fn publish_file(&self, record: &Record, path: &std::path::Path) -> Result<()> {
+            self.inner.publish_file(record, path).await?;
+            if !self.pause_on_create {
+                self.published.notify_one();
+                self.resume.notified().await;
+            }
+            Ok(())
+        }
+        async fn get(
+            &self,
+            namespace: &str,
+            name: &str,
+            version: &str,
+        ) -> Result<(Record, Vec<u8>)> {
+            self.inner.get(namespace, name, version).await
+        }
+        async fn record(&self, namespace: &str, name: &str, version: &str) -> Result<Record> {
+            self.inner.record(namespace, name, version).await
+        }
+        async fn stream(
+            &self,
+            namespace: &str,
+            name: &str,
+            version: &str,
+        ) -> Result<(Record, storage::ArtifactStream)> {
+            self.inner.stream(namespace, name, version).await
+        }
+        async fn records(&self) -> Result<Vec<Record>> {
+            self.inner.records().await
+        }
+        async fn ready(&self) -> bool {
+            self.inner.ready().await
+        }
+        async fn put_task(&self, id: &str, bytes: &[u8]) -> Result<()> {
+            self.inner.put_task(id, bytes).await?;
+            if self.pause_on_create
+                && serde_json::from_slice::<ImportTask>(bytes)?.state == "running"
+            {
+                self.published.notify_one();
+                self.resume.notified().await;
+            }
+            Ok(())
+        }
+        async fn get_task(&self, id: &str) -> Result<Vec<u8>> {
+            self.inner.get_task(id).await
+        }
+        async fn tasks(&self) -> Result<Vec<(String, Vec<u8>)>> {
+            self.inner.tasks().await
+        }
+        async fn reconcile(&self, records: &[Record]) -> Result<()> {
+            self.inner.reconcile(records).await
+        }
+    }
+
     async fn http_request(
         app: Router,
         method: &str,
@@ -2375,6 +2476,7 @@ mod tests {
             failed_logins: Arc::new(Mutex::new(HashMap::new())),
             auth_gate: Arc::new(RwLock::new(0)),
             refresh_slots: Arc::new(Semaphore::new(8)),
+            publications: TaskTracker::new(),
         }
     }
 
@@ -2472,6 +2574,19 @@ mod tests {
             .unwrap();
         assert_eq!(reconciled[&task_id].state, "completed");
         assert!(reconciled[&task_id].finished);
+
+        let incomplete_id = uuid::Uuid::new_v4().to_string();
+        let mut incomplete = task.clone();
+        incomplete.version = Some("2.0.0".into());
+        storage
+            .put_task(&incomplete_id, &serde_json::to_vec(&incomplete).unwrap())
+            .await
+            .unwrap();
+        let reconciled = reconcile_tasks(&storage, std::slice::from_ref(&record))
+            .await
+            .unwrap();
+        assert_eq!(reconciled[&incomplete_id].state, "failed");
+        assert!(reconciled[&incomplete_id].finished);
     }
 
     #[tokio::test]
@@ -3184,6 +3299,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publication_completes_after_client_disconnects() {
+        publication_survives_disconnect_and_shutdown(false).await;
+    }
+
+    #[tokio::test]
+    async fn task_creation_completes_after_client_disconnects() {
+        publication_survives_disconnect_and_shutdown(true).await;
+    }
+
+    async fn publication_survives_disconnect_and_shutdown(pause_on_create: bool) {
+        let mut state = state().await;
+        let directory = tempfile::tempdir().unwrap();
+        let tokens = tempfile::tempdir().unwrap();
+        std::fs::write(tokens.path().join("engineering.write.secrets"), "writer\n").unwrap();
+        let published = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        state.storage = Arc::new(PausedPublishStorage {
+            inner: storage::LocalStorage::new(directory.path().to_path_buf()),
+            published: published.clone(),
+            resume: resume.clone(),
+            pause_on_create,
+        });
+        {
+            let mut config = state.config.write().await;
+            config.token_dir = tokens.path().to_path_buf();
+            config.namespaces.push(crate::config::NamespaceConfig {
+                name: "engineering".into(),
+                push_networks: vec![],
+            });
+        }
+        let (body, archive) = upload_body("engineering", "3.0.0");
+        let mut request = Request::post("/api/galaxy/v3/artifacts/collections/")
+            .header(
+                "content-type",
+                "multipart/form-data; boundary=security-boundary",
+            )
+            .header("authorization", "Bearer writer")
+            .body(Body::from(body))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        ));
+        let handler =
+            tokio::spawn(public_router(state.clone(), true, 1024 * 1024).oneshot(request));
+        tokio::time::timeout(std::time::Duration::from_secs(5), published.notified())
+            .await
+            .unwrap();
+        handler.abort();
+        let _ = handler.await;
+        assert_eq!(state.upload_slots.available_permits(), 1);
+        state.publications.close();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            state.publications.wait(),
+        )
+        .await
+        .is_err());
+        resume.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), state.publications.wait())
+            .await
+            .unwrap();
+        assert_eq!(state.upload_slots.available_permits(), 2);
+        assert_eq!(state.catalog.read().await.len(), 1);
+        let persisted = state.storage.tasks().await.unwrap();
+        assert_eq!(persisted.len(), 1);
+        let task: ImportTask = serde_json::from_slice(&persisted[0].1).unwrap();
+        assert!(task.finished);
+        assert_eq!(task.state, "completed");
+        assert_eq!(
+            state
+                .storage
+                .get("engineering", "common", "3.0.0")
+                .await
+                .unwrap()
+                .1,
+            archive
+        );
+    }
+
+    #[tokio::test]
     async fn oidc_callback_validates_identity_and_rejects_login_after_reload() {
         use std::sync::atomic::AtomicU8;
         const TEST_SIGNING_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIGrD/e7uKYqSY4twDEsRfMMuLSrODf14dpTiTK6K1YI0\n-----END PRIVATE KEY-----\n";
@@ -3224,6 +3419,7 @@ mod tests {
                 let release = token_release.clone();
                 async move {
                     assert_eq!(form.get("grant_type").map(String::as_str), Some("authorization_code"));
+                    assert_eq!(form.get("redirect_uri").map(String::as_str), Some("http://localhost:18080/auth/oidc/callback"));
                     assert_eq!(form.get("client_secret").map(String::as_str), Some("test-secret"));
                     assert!(form.get("code_verifier").is_some_and(|v| !v.is_empty()));
                     if mode.load(Ordering::SeqCst) == 3 {
@@ -3263,7 +3459,7 @@ mod tests {
             cfg.auth.oidc.issuer_url = issuer;
             cfg.auth.oidc.client_id = "galaxyd".into();
             cfg.auth.oidc.client_secret_file = secret_path;
-            cfg.auth.oidc.redirect_url = "http://localhost:8080/auth/oidc/callback".into();
+            cfg.server.public_url = "http://localhost:18080".into();
             cfg.auth.oidc.group_mappings = vec![
                 crate::config::GroupMapping {
                     group: "admins".into(),
@@ -3291,6 +3487,14 @@ mod tests {
             assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
             let location =
                 url::Url::parse(response.headers()["location"].to_str().unwrap()).unwrap();
+            assert_eq!(
+                location
+                    .query_pairs()
+                    .find(|(key, _)| key == "redirect_uri")
+                    .unwrap()
+                    .1,
+                "http://localhost:18080/auth/oidc/callback"
+            );
             let login_state = location
                 .query_pairs()
                 .find(|(key, _)| key == "state")

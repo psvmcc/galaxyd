@@ -72,7 +72,7 @@ Authorization: Bearer new-token
 
 The server reads the file for each authorization decision. Adding a token enables it without a restart; removing a token revokes it for the next decision. Missing, unreadable, or empty files deny publishing for that namespace. Keep secrets readable only by the service (mode 0600 when owned by it, or 0640 with a dedicated service group), make secret directories non-writable by the service where possible, and never log secret contents.
 
-Uploads are authorized before their body is processed, streamed into a temporary file, validated off the async runtime, and then streamed into local or S3 storage. Artifact downloads are streamed from storage. API timestamps are RFC3339 UTC strings without fractional seconds.
+Uploads are authorized before their body is processed, streamed into a temporary file, validated off the async runtime, and then streamed into local or S3 storage. Import task creation and publication finish independently of the HTTP connection. Graceful shutdown waits for these operations, including their final task status updates. Artifact downloads are streamed from storage. API timestamps are RFC3339 UTC strings without fractional seconds.
 
 A token in one namespace's file does not authorize uploads to another namespace. The same token authorizes both only when it is explicitly present in both files.
 
@@ -80,7 +80,7 @@ Global authorization is disabled by default for compatibility; with this setting
 
 Complete authorization examples are provided in [`config/galaxyd.auth.local.example.toml`](config/galaxyd.auth.local.example.toml), [`config/galaxyd.auth.local.example.yaml`](config/galaxyd.auth.local.example.yaml), [`config/galaxyd.auth.oidc.example.toml`](config/galaxyd.auth.oidc.example.toml), and [`config/galaxyd.auth.oidc.example.yaml`](config/galaxyd.auth.oidc.example.yaml).
 
-OIDC sessions request `offline_access` by default. Configure the provider to issue refresh tokens to this client, or set `request_offline_access = false` if that scope is unsupported. On the first request after `refresh_interval_seconds` (default: 300), the server refreshes groups and replaces the session's permissions. A rejected refresh token or missing refresh token ends the session; the user must sign in again. A temporary provider error returns `503` for the protected request and keeps the session for a later retry without granting access using stale rights. Role changes may take longer than the interval if the provider caches group membership. A session still ends at `session_ttl_seconds` even when refresh succeeds.
+OIDC sessions request `offline_access` by default. Configure the provider to issue refresh tokens to this client, or set `request_offline_access = false` if that scope is unsupported. Register `server.public_url` plus `/auth/oidc/callback` as the redirect URI with the provider. On the first request after `refresh_interval_seconds` (default: 300), the server refreshes groups and replaces the session's permissions. A rejected refresh token or missing refresh token ends the session; the user must sign in again. A temporary provider error returns `503` for the protected request and keeps the session for a later retry without granting access using stale rights. Role changes may take longer than the interval if the provider caches group membership. A session still ends at `session_ttl_seconds` even when refresh succeeds.
 
 ## Publishing networks and forwarded IPs
 
@@ -147,7 +147,7 @@ just container-run
 
 The runtime image is scratch, runs as a numeric non-root user, and includes the CA bundle required for HTTPS S3 endpoints. Mount configuration, token files, and local storage into the container. TLS for incoming traffic is expected to terminate in nginx or another reverse proxy.
 
-The supplied image builds a native static binary for x86_64 or AArch64. Run one active galaxyd process for each local storage root or S3 bucket prefix. Publication records are the visibility boundary: an artifact is downloadable only after its immutable JSON record has been committed. Completed import tasks are persisted in the configured backend and remain pollable after restart.
+The supplied image builds a native static binary for x86_64 or AArch64. Run one active galaxyd process for each local storage root or S3 bucket prefix. Publication records are the visibility boundary: an artifact is downloadable only after its immutable JSON record has been committed. Completed import tasks are persisted in the configured backend and remain pollable after restart. On restart, unfinished tasks are reconciled immediately against committed records. The main branch publishes the `latest` container tag; releases publish versioned tags only.
 
 The compatibility tests target the Galaxy v3 response fields consumed by `ansible-core` 2.19. Before supporting another client release, add it to the publish/install interoperability matrix and verify its exact API contract.
 

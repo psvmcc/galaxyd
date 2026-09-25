@@ -67,7 +67,6 @@ jobs:
           images: ghcr.io/${{ github.repository }}
           tags: |
             type=ref,event=tag
-            type=raw,value=latest
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ github.ref_name }}

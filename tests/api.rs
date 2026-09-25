@@ -86,6 +86,7 @@ async fn exposes_ansible_collection_version_contract() {
         failed_logins: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         auth_gate: Arc::new(RwLock::new(0)),
         refresh_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+        publications: tokio_util::task::TaskTracker::new(),
     };
     let app = public_router(state, true, 16 * 1024 * 1024);
     let response = app
@@ -135,6 +136,7 @@ async fn exposes_ansible_collection_version_contract() {
 #[tokio::test]
 async fn accepts_multipart_larger_than_axum_default_limit() {
     use axum::{body::Body, extract::ConnectInfo, http::Request};
+    use base64::Engine;
     use flate2::{write::GzEncoder, Compression};
     use galaxyd::{
         app::{public_router, AppState},
@@ -178,6 +180,7 @@ async fn accepts_multipart_larger_than_axum_default_limit() {
         failed_logins: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         auth_gate: Arc::new(RwLock::new(0)),
         refresh_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+        publications: tokio_util::task::TaskTracker::new(),
     };
 
     let mut payload = vec![0u8; 3 * 1024 * 1024];
@@ -231,9 +234,46 @@ async fn accepts_multipart_larger_than_axum_default_limit() {
     request.extensions_mut().insert(ConnectInfo(
         "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
     ));
-    let response = public_router(state, true, 8 * 1024 * 1024)
+    let response = public_router(state.clone(), true, 8 * 1024 * 1024)
         .oneshot(request)
         .await
         .unwrap();
     assert_eq!(response.status(), 202);
+
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&artifact);
+    let base64_body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"sha256\"\r\n\r\n{checksum}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"collection.tar.gz\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n--{boundary}--\r\n");
+    assert!(base64_body.len() > artifact.len() + 1024 * 1024);
+    let request = || {
+        let mut request = Request::post("/api/galaxy/v3/artifacts/collections/")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .header("authorization", "Token secret")
+            .body(Body::from(base64_body.clone()))
+            .unwrap();
+        request.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        ));
+        request
+    };
+    let decoded_limit = artifact.len();
+    state.config.write().await.network.max_upload_bytes = decoded_limit;
+    assert!(base64_body.len() > decoded_limit + 1024 * 1024);
+    let response = public_router(state.clone(), true, decoded_limit)
+        .oneshot(request())
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        409,
+        "decoded archive reached duplicate check"
+    );
+
+    state.config.write().await.network.max_upload_bytes = 1024 * 1024;
+    let response = public_router(state, true, 1024 * 1024)
+        .oneshot(request())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 413);
 }

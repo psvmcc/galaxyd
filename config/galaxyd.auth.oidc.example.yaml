@@ -15,7 +15,6 @@ auth:
     issuer_url: https://login.example.org/realms/company
     client_id: galaxyd
     client_secret_file: /etc/galaxyd/oidc-client.secret
-    redirect_url: https://galaxy.example.org/auth/oidc/callback
     display_name: Company SSO
     groups_claim: groups
     group_mappings:

@@ -33,7 +33,6 @@ refresh_interval_seconds = 300
 issuer_url = "https://login.example.org/realms/company"
 client_id = "galaxyd"
 client_secret_file = "/etc/galaxyd/oidc-client.secret"
-redirect_url = "https://galaxy.example.org/auth/oidc/callback"
 display_name = "Company SSO"
 groups_claim = "groups"
 
@@ -174,6 +173,8 @@ Local login and logout require the browser's `Origin` to match `server.public_ur
 
 OIDC `request_offline_access` defaults to `true`. Set it to `false` only when the provider rejects that scope. `refresh_interval_seconds` defaults to 300 and must be shorter than `session_ttl_seconds`. The server checks current groups on the first request after that interval. Without a refresh token, the session ends at that check and the user signs in again. A temporary provider error returns `503` while preserving the session for a later retry; revoked refresh credentials end the session.
 
+The OIDC redirect URI is `server.public_url` plus `/auth/oidc/callback`. Register that full URI in the identity provider. With OIDC enabled, `server.public_url` must use HTTPS, except for HTTP on loopback during development. Remove `auth.oidc.redirect_url` from existing configurations; it is no longer accepted.
+
 Generate a local administrator password hash without putting the password in shell history:
 
 ~~~bash
@@ -192,6 +193,7 @@ Each namespace entry contains:
 - push_networks: optional CIDR list. Empty or omitted means all source addresses are allowed after token authentication.
 
 The upload namespace comes from MANIFEST.json and must match a configured namespace.
+`max_upload_bytes` limits the decoded collection archive. Multipart uploads using base64 may use more bytes on the wire; the server separately limits the encoded request body. Archives with PAX size overrides or oversized TAR extension records are rejected.
 
 ## Reload
 
